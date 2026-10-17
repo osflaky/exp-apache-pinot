@@ -1,0 +1,270 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pinot.common.metrics.prometheus;
+
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+import org.apache.pinot.common.metrics.MseMeter;
+import org.apache.pinot.common.metrics.MseMetrics;
+import org.apache.pinot.common.metrics.MseMetricsMode;
+import org.apache.pinot.common.metrics.MseTimer;
+import org.apache.pinot.common.metrics.ServerGauge;
+import org.apache.pinot.common.metrics.ServerMeter;
+import org.apache.pinot.common.metrics.ServerMetrics;
+import org.apache.pinot.common.metrics.ServerTimer;
+import org.apache.pinot.spi.data.OpenStructNaming;
+import org.testng.annotations.BeforeClass;
+import org.testng.annotations.DataProvider;
+import org.testng.annotations.Test;
+
+
+public abstract class ServerPrometheusMetricsTest extends PinotPrometheusMetricsTest {
+  //all exported server metrics have this prefix
+  private static final String EXPORTED_METRIC_PREFIX = "pinot_server_";
+
+  private static final List<ServerMeter> METERS_ACCEPTING_CLIENT_ID =
+      List.of(ServerMeter.REALTIME_ROWS_CONSUMED, ServerMeter.REALTIME_ROWS_SANITIZED,
+          ServerMeter.REALTIME_ROWS_FETCHED, ServerMeter.REALTIME_ROWS_FILTERED,
+          ServerMeter.INVALID_REALTIME_ROWS_DROPPED, ServerMeter.INCOMPLETE_REALTIME_ROWS_CONSUMED,
+          ServerMeter.STREAM_CONSUMER_CREATE_EXCEPTIONS, ServerMeter.ROWS_WITH_ERRORS);
+
+  private static final List<ServerMeter> METERS_ACCEPTING_RAW_TABLE_NAMES =
+      List.of(ServerMeter.SEGMENT_UPLOAD_FAILURE, ServerMeter.SEGMENT_UPLOAD_SUCCESS,
+          ServerMeter.SEGMENT_UPLOAD_TIMEOUT);
+
+  //gauges that accept clientId
+  private static final List<ServerGauge> GAUGES_ACCEPTING_CLIENT_ID =
+      List.of(ServerGauge.LLC_PARTITION_CONSUMING, ServerGauge.HIGHEST_STREAM_OFFSET_CONSUMED,
+          ServerGauge.LAST_REALTIME_SEGMENT_CREATION_DURATION_SECONDS,
+          ServerGauge.LAST_REALTIME_SEGMENT_CREATION_WAIT_TIME_SECONDS,
+          ServerGauge.LAST_REALTIME_SEGMENT_INITIAL_CONSUMPTION_DURATION_SECONDS,
+          ServerGauge.LAST_REALTIME_SEGMENT_CATCHUP_DURATION_SECONDS,
+          ServerGauge.LAST_REALTIME_SEGMENT_COMPLETION_DURATION_SECONDS);
+
+  private static final List<ServerGauge> GAUGES_ACCEPTING_PARTITION =
+      List.of(ServerGauge.UPSERT_VALID_DOC_ID_SNAPSHOT_COUNT, ServerGauge.UPSERT_PRIMARY_KEYS_IN_SNAPSHOT_COUNT,
+          ServerGauge.REALTIME_INGESTION_OFFSET_LAG, ServerGauge.REALTIME_INGESTION_DELAY_MS,
+          ServerGauge.UPSERT_PRIMARY_KEYS_COUNT, ServerGauge.DEDUP_PRIMARY_KEYS_COUNT,
+          ServerGauge.REALTIME_INGESTION_UPSTREAM_OFFSET, ServerGauge.REALTIME_INGESTION_CONSUMING_OFFSET);
+
+  private static final List<ServerGauge> GAUGES_ACCEPTING_RAW_TABLE_NAME =
+      List.of(ServerGauge.REALTIME_OFFHEAP_MEMORY_USED, ServerGauge.REALTIME_SEGMENT_NUM_PARTITIONS,
+          ServerGauge.LUCENE_INDEXING_DELAY_MS, ServerGauge.LUCENE_INDEXING_DELAY_DOCS);
+
+  // OPEN_STRUCT metrics carry a third name segment that the generic rules cannot parse: "<column>" for the
+  // column-level ones and "<column>$<key>" for the per-key gauge. Emitting them with a plain
+  // tableNameWithType (what the default branches below do) produces a name the OPEN_STRUCT rules do not
+  // match at all, so a generic rule claims it and the assertion passes against a shape that never occurs in
+  // production. They are dispatched separately so the exported labels are checked against the real name.
+  private static final String OPEN_STRUCT_COLUMN = "metrics";
+  // The key as ingested. Exercises an embedded '$', a '.', a '-' and a '"'. The '$' is worth pinning
+  // because it is the column/key delimiter, so only a column group that stops at the first '$' and a
+  // greedy key group that takes the rest can round-trip it. The '"' is worth pinning because
+  // ObjectName.quote backslash-escapes it on the way to JMX, which stops the name matching the scrape
+  // rule at all — the metric would silently lose its column/key labels. OpenStructNaming#metricKey
+  // percent-escapes it before emission, so the exported label is OPEN_STRUCT_KEY_EXPORTED below. Spaces
+  // are legal in a label value but are not covered: PromMetric#fromExportedMetric splits the scrape line
+  // on the first space, so a space defeats the harness, not the exporter.
+  private static final String OPEN_STRUCT_KEY = "clicks.v2$promo\"code";
+  // '"' escaped to '%22'; '.', '-' and '$' pass through untouched.
+  private static final String OPEN_STRUCT_KEY_EXPORTED = "clicks.v2$promo%22code";
+  private static final String LABEL_KEY_COLUMN = "column";
+  private static final String LABEL_KEY_KEY = "key";
+
+  private static final List<ServerGauge> GAUGES_ACCEPTING_OPEN_STRUCT_COLUMN =
+      List.of(ServerGauge.OPEN_STRUCT_LAST_SEGMENT_DENSE_KEY_COUNT,
+          ServerGauge.OPEN_STRUCT_LAST_SEGMENT_SPARSE_KEY_COUNT,
+          ServerGauge.OPEN_STRUCT_LAST_SEGMENT_KEY_COUNT, ServerGauge.OPEN_STRUCT_LAST_SEGMENT_DOC_COUNT);
+
+  private static final List<ServerMeter> METERS_ACCEPTING_OPEN_STRUCT_COLUMN =
+      List.of(ServerMeter.OPEN_STRUCT_TYPE_COERCION_FAILURES, ServerMeter.OPEN_STRUCT_TYPE_INFERENCE_FAILURES);
+
+  private static final List<String> TABLENAME_TABLETYPE_COLUMN =
+      List.of(ExportedLabelKeys.TABLE, ExportedLabelValues.TABLENAME, ExportedLabelKeys.TABLETYPE,
+          ExportedLabelValues.TABLETYPE_REALTIME, LABEL_KEY_COLUMN, OPEN_STRUCT_COLUMN);
+
+  private static final List<String> TABLENAME_TABLETYPE_COLUMN_KEY =
+      List.of(ExportedLabelKeys.TABLE, ExportedLabelValues.TABLENAME, ExportedLabelKeys.TABLETYPE,
+          ExportedLabelValues.TABLETYPE_REALTIME, LABEL_KEY_COLUMN, OPEN_STRUCT_COLUMN, LABEL_KEY_KEY,
+          OPEN_STRUCT_KEY_EXPORTED);
+
+  // pinot.mse.* metrics share the role-agnostic prefix and must be exported from every JVM role
+  // that registers MseMetrics; on server JVMs this exercises the server.yml catch-all rule.
+  private static final String EXPORTED_MSE_METRIC_PREFIX = "pinot_mse_";
+
+  private ServerMetrics _serverMetrics;
+
+  private MseMetrics _mseMetrics;
+
+  @BeforeClass
+  public void setup()
+      throws Exception {
+    _serverMetrics = new ServerMetrics(_pinotMetricsFactory.getPinotMetricsRegistry());
+    // MSE mode so emissions land in this JVM's PinotMetricsRegistry (the one the JMX exporter is
+    // scraping). MseMetrics is constructed with the shared registry, mirroring how server JVMs
+    // running in MSE/DUAL mode emit pinot.mse.* beans alongside pinot.server.*.
+    _mseMetrics = new MseMetrics(MseMetricsMode.MSE, _pinotMetricsFactory.getPinotMetricsRegistry());
+  }
+
+  @Test(dataProvider = "serverTimers")
+  public void timerTest(ServerTimer serverTimer) {
+    if (serverTimer.isGlobal()) {
+      _serverMetrics.addTimedValue(serverTimer, 30_000, TimeUnit.MILLISECONDS);
+      assertTimerExportedCorrectly(serverTimer.getTimerName(), EXPORTED_METRIC_PREFIX);
+    } else {
+      _serverMetrics.addTimedTableValue(TABLE_NAME_WITH_TYPE, serverTimer, 30_000L, TimeUnit.MILLISECONDS);
+      _serverMetrics.addTimedTableValue(ExportedLabelValues.TABLENAME, serverTimer, 30_000L, TimeUnit.MILLISECONDS);
+
+      assertTimerExportedCorrectly(serverTimer.getTimerName(), ExportedLabels.TABLENAME_TABLETYPE,
+          EXPORTED_METRIC_PREFIX);
+      assertTimerExportedCorrectly(serverTimer.getTimerName(), ExportedLabels.TABLENAME, EXPORTED_METRIC_PREFIX);
+    }
+  }
+
+  @Test(dataProvider = "serverMeters")
+  public void meterTest(ServerMeter serverMeter) {
+    if (serverMeter.isGlobal()) {
+      _serverMetrics.addMeteredGlobalValue(serverMeter, 4L);
+      //we cannot use raw meter names for all meters as exported metrics don't follow any convention currently.
+      // For example, meters that track realtime exceptions start with prefix "realtime_exceptions"
+      if (meterTrackingRealtimeExceptions(serverMeter)) {
+        assertMeterExportedCorrectly(getRealtimeExceptionMeterName(serverMeter));
+      } else {
+        assertMeterExportedCorrectly(serverMeter.getMeterName());
+      }
+    } else {
+      if (METERS_ACCEPTING_CLIENT_ID.contains(serverMeter)) {
+        addMeterWithLabels(serverMeter, CLIENT_ID);
+        assertMeterExportedCorrectly(serverMeter.getMeterName(),
+            ExportedLabels.PARTITION_TABLENAME_TABLETYPE_KAFKATOPIC);
+      } else if (METERS_ACCEPTING_RAW_TABLE_NAMES.contains(serverMeter)) {
+        addMeterWithLabels(serverMeter, ExportedLabelValues.TABLENAME);
+        assertMeterExportedCorrectly(serverMeter.getMeterName(), ExportedLabels.TABLENAME);
+      } else if (METERS_ACCEPTING_OPEN_STRUCT_COLUMN.contains(serverMeter)) {
+        _serverMetrics.addMeteredTableValue(TABLE_NAME_WITH_TYPE, OPEN_STRUCT_COLUMN, serverMeter, 4L);
+        assertMeterExportedCorrectly(serverMeter.getMeterName(), TABLENAME_TABLETYPE_COLUMN);
+      } else {
+        //we pass tableNameWithType to all remaining meters
+        addMeterWithLabels(serverMeter, TABLE_NAME_WITH_TYPE);
+        assertMeterExportedCorrectly(serverMeter.getMeterName(), ExportedLabels.TABLENAME_TABLETYPE);
+      }
+    }
+  }
+
+  @Test(dataProvider = "serverGauges")
+  public void gaugeTest(ServerGauge serverGauge) {
+    if (serverGauge.isGlobal()) {
+      _serverMetrics.setValueOfGlobalGauge(serverGauge, 10L);
+      assertGaugeExportedCorrectly(serverGauge.getGaugeName(), EXPORTED_METRIC_PREFIX);
+    } else {
+      if (GAUGES_ACCEPTING_CLIENT_ID.contains(serverGauge)) {
+        addGaugeWithLabels(serverGauge, CLIENT_ID);
+        assertGaugeExportedCorrectly(serverGauge.getGaugeName(),
+            ExportedLabels.PARTITION_TABLENAME_TABLETYPE_KAFKATOPIC, EXPORTED_METRIC_PREFIX);
+      } else if (GAUGES_ACCEPTING_PARTITION.contains(serverGauge)) {
+        addPartitionGaugeWithLabels(serverGauge, TABLE_NAME_WITH_TYPE);
+        assertGaugeExportedCorrectly(serverGauge.getGaugeName(), ExportedLabels.PARTITION_TABLENAME_TABLETYPE,
+            EXPORTED_METRIC_PREFIX);
+      } else if (GAUGES_ACCEPTING_RAW_TABLE_NAME.contains(serverGauge)) {
+        addGaugeWithLabels(serverGauge, ExportedLabelValues.TABLENAME);
+        assertGaugeExportedCorrectly(serverGauge.getGaugeName(), ExportedLabels.TABLENAME, EXPORTED_METRIC_PREFIX);
+      } else if (serverGauge == ServerGauge.OPEN_STRUCT_LAST_SEGMENT_KEY_DOC_COUNT) {
+        _serverMetrics.setOrUpdateTableGauge(TABLE_NAME_WITH_TYPE,
+            OpenStructNaming.metricKey(OPEN_STRUCT_COLUMN, OPEN_STRUCT_KEY), serverGauge, 100L);
+        assertGaugeExportedCorrectly(serverGauge.getGaugeName(), TABLENAME_TABLETYPE_COLUMN_KEY,
+            EXPORTED_METRIC_PREFIX);
+      } else if (GAUGES_ACCEPTING_OPEN_STRUCT_COLUMN.contains(serverGauge)) {
+        _serverMetrics.setOrUpdateTableGauge(TABLE_NAME_WITH_TYPE, OPEN_STRUCT_COLUMN, serverGauge, 100L);
+        assertGaugeExportedCorrectly(serverGauge.getGaugeName(), TABLENAME_TABLETYPE_COLUMN, EXPORTED_METRIC_PREFIX);
+      } else {
+        addGaugeWithLabels(serverGauge, TABLE_NAME_WITH_TYPE);
+        assertGaugeExportedCorrectly(serverGauge.getGaugeName(), ExportedLabels.TABLENAME_TABLETYPE,
+            EXPORTED_METRIC_PREFIX);
+      }
+    }
+  }
+
+  private void addGaugeWithLabels(ServerGauge serverGauge, String labels) {
+    _serverMetrics.setValueOfTableGauge(labels, serverGauge, 100L);
+  }
+
+  private void addPartitionGaugeWithLabels(ServerGauge serverGauge, String labels) {
+    _serverMetrics.setValueOfPartitionGauge(labels, 3, serverGauge, 100L);
+  }
+
+  public void addMeterWithLabels(ServerMeter serverMeter, String labels) {
+    _serverMetrics.addMeteredTableValue(labels, serverMeter, 4L);
+  }
+
+  @Test(dataProvider = "mseMeters")
+  public void mseMeterExportedFromServerJmx(MseMeter meter) {
+    _mseMetrics.addMeteredGlobalValue(meter, 1L);
+    assertMeterExportedCorrectly(meter.getMeterName(), EXPORTED_MSE_METRIC_PREFIX);
+  }
+
+  @Test(dataProvider = "mseTimers")
+  public void mseTimerExportedFromServerJmx(MseTimer timer) {
+    _mseMetrics.addTimedValue(timer, 30_000, TimeUnit.MILLISECONDS);
+    assertTimerExportedCorrectly(timer.getTimerName(), EXPORTED_MSE_METRIC_PREFIX);
+  }
+
+  @DataProvider(name = "serverTimers")
+  public Object[] serverTimers() {
+    return ServerTimer.values();  // Provide all values of ServerTimer enum
+  }
+
+  @DataProvider(name = "serverMeters")
+  public Object[] serverMeter() {
+    return ServerMeter.values();  // Provide all values of ServerTimer enum
+  }
+
+  @DataProvider(name = "serverGauges")
+  public Object[] serverGauge() {
+    return ServerGauge.values();  // Provide all values of ServerTimer enum
+  }
+
+  @DataProvider(name = "mseMeters")
+  public Object[] mseMeters() {
+    return MseMeter.values();
+  }
+
+  @DataProvider(name = "mseTimers")
+  public Object[] mseTimers() {
+    return MseTimer.values();
+  }
+
+  private boolean meterTrackingRealtimeExceptions(ServerMeter serverMeter) {
+    return serverMeter == ServerMeter.REQUEST_DESERIALIZATION_EXCEPTIONS
+        || serverMeter == ServerMeter.RESPONSE_SERIALIZATION_EXCEPTIONS
+        || serverMeter == ServerMeter.SCHEDULING_TIMEOUT_EXCEPTIONS || serverMeter == ServerMeter.UNCAUGHT_EXCEPTIONS;
+  }
+
+  private String getRealtimeExceptionMeterName(ServerMeter serverMeter) {
+    String meterName = serverMeter.getMeterName();
+    return "realtime_exceptions_" + meterName.substring(0, meterName.lastIndexOf("Exceptions"));
+  }
+
+  private void assertMeterExportedCorrectly(String exportedMeterName) {
+    assertMeterExportedCorrectly(exportedMeterName, EXPORTED_METRIC_PREFIX);
+  }
+
+  private void assertMeterExportedCorrectly(String exportedMeterName, List<String> labels) {
+    assertMeterExportedCorrectly(exportedMeterName, labels, EXPORTED_METRIC_PREFIX);
+  }
+}

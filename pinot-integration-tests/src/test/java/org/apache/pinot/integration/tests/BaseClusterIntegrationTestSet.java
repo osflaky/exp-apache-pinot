@@ -1,0 +1,1171 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pinot.integration.tests;
+import com.fasterxml.jackson.databind.JsonNode;
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.sql.Timestamp;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.helix.PropertyKey;
+import org.apache.helix.model.ExternalView;
+import org.apache.helix.model.HelixConfigScope;
+import org.apache.helix.model.IdealState;
+import org.apache.helix.model.InstanceConfig;
+import org.apache.helix.model.builder.HelixConfigScopeBuilder;
+import org.apache.pinot.client.ResultSet;
+import org.apache.pinot.client.ResultSetGroup;
+import org.apache.pinot.client.admin.PinotAdminException;
+import org.apache.pinot.client.admin.PinotAdminNotFoundException;
+import org.apache.pinot.common.restlet.resources.PinotTableReloadStatusResponse;
+import org.apache.pinot.common.restlet.resources.RebalanceConfig;
+import org.apache.pinot.common.restlet.resources.RebalanceResult;
+import org.apache.pinot.common.restlet.resources.ServerRebalanceJobStatusResponse;
+import org.apache.pinot.common.restlet.resources.TableSegmentsReloadCheckResponse;
+import org.apache.pinot.common.restlet.resources.TableView;
+import org.apache.pinot.common.utils.LLCSegmentName;
+import org.apache.pinot.common.utils.config.InstanceUtils;
+import org.apache.pinot.controller.util.ConsumingSegmentInfoReader;
+import org.apache.pinot.core.query.utils.idset.IdSet;
+import org.apache.pinot.core.query.utils.idset.IdSets;
+import org.apache.pinot.spi.config.instance.Instance;
+import org.apache.pinot.spi.config.table.TableConfig;
+import org.apache.pinot.spi.config.table.TableType;
+import org.apache.pinot.spi.config.table.TenantConfig;
+import org.apache.pinot.spi.data.DimensionFieldSpec;
+import org.apache.pinot.spi.data.FieldSpec;
+import org.apache.pinot.spi.data.MetricFieldSpec;
+import org.apache.pinot.spi.data.Schema;
+import org.apache.pinot.spi.utils.CommonConstants;
+import org.apache.pinot.spi.utils.InstanceTypeUtils;
+import org.apache.pinot.spi.utils.JsonUtils;
+import org.apache.pinot.spi.utils.StringUtil;
+import org.apache.pinot.spi.utils.builder.TableNameBuilder;
+import org.apache.pinot.util.TestUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.testng.Assert;
+import org.testng.annotations.BeforeMethod;
+
+import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertFalse;
+import static org.testng.Assert.assertNotNull;
+import static org.testng.Assert.assertTrue;
+
+
+/// Shared set of common tests for cluster integration tests.
+///
+/// To enable the test, override it and add @Test annotation.
+public abstract class BaseClusterIntegrationTestSet extends BaseClusterIntegrationTest {
+  private static final Logger LOGGER = LoggerFactory.getLogger(BaseClusterIntegrationTestSet.class);
+
+  // Default settings
+  private static final String DEFAULT_QUERY_FILE_NAME =
+      "On_Time_On_Time_Performance_2014_100k_subset.test_queries_200.sql";
+  private static final int DEFAULT_NUM_QUERIES_TO_GENERATE = 100;
+
+  @BeforeMethod
+  public void resetMultiStage() {
+    setUseMultiStageQueryEngine(false);
+  }
+
+  /// Can be overridden to change default setting
+  protected String getQueryFileName() {
+    return DEFAULT_QUERY_FILE_NAME;
+  }
+
+  /// Can be overridden to change default setting
+  protected int getNumQueriesToGenerate() {
+    return DEFAULT_NUM_QUERIES_TO_GENERATE;
+  }
+
+  /// Test hard-coded queries.
+  /// @throws Exception
+  public void testHardcodedQueries()
+      throws Exception {
+    testHardcodedQueriesCommon();
+    if (useMultiStageQueryEngine()) {
+      testHardcodedQueriesV2();
+    } else {
+      testHardCodedQueriesV1();
+    }
+  }
+
+  /// Test hardcoded queries.
+  ///
+  /// NOTE:
+  ///
+  /// For queries with `LIMIT`, need to remove limit or add `LIMIT 10000` to the H2 SQL query
+  /// because the comparison only works on exhausted result with at most 10000 rows.
+  ///
+  /// - Eg. `SELECT a FROM table LIMIT 15 -> [SELECT a FROM table LIMIT 10000]`
+  ///
+  /// For group-by queries, need to add group-by columns to the select clause for H2 queries.
+  ///
+  /// - Eg. `SELECT SUM(a) FROM table GROUP BY b -> [SELECT b, SUM(a) FROM table GROUP BY b]`
+  ///
+  /// TODO: Selection queries, Aggregation Group By queries, Order By, Distinct
+  ///  This list is very basic right now (aggregations only) and needs to be enriched
+  private void testHardcodedQueriesCommon()
+      throws Exception {
+    String query;
+    String h2Query;
+    // Literal early evaluation
+    query = "SELECT DATETIMECONVERT(1697762729000, '1:MILLISECONDS:EPOCH', '1:DAYS:EPOCH', '1:DAYS') from mytable";
+    h2Query = "SELECT 19650";
+    testQuery(query, h2Query);
+
+    // SUM INTEGER result will be BIGINT
+    query = "SELECT SUM(ActualElapsedTime) FROM mytable";
+    testQuery(query);
+    // SUM FLOAT result will be FLOAT
+    query = "SELECT SUM(CAST(ActualElapsedTime AS FLOAT)) FROM mytable";
+    testQuery(query);
+    // SUM DOUBLE result will be DOUBLE
+    query = "SELECT SUM(CAST(ActualElapsedTime AS DOUBLE)) FROM mytable";
+    testQuery(query);
+    query = "SELECT COUNT(*) FROM mytable WHERE CarrierDelay=15 AND ArrDelay > CarrierDelay LIMIT 1";
+    testQuery(query);
+    query =
+        "SELECT ArrDelay, CarrierDelay, (ArrDelay - CarrierDelay) AS diff, substring(DestStateName, 4, 8) as "
+            + "stateSubStr FROM mytable WHERE CarrierDelay=15 AND "
+            + "ArrDelay > CarrierDelay ORDER BY diff, ArrDelay, CarrierDelay LIMIT 100000";
+    testQuery(query);
+    query = "SELECT COUNT(*) FROM mytable WHERE ArrDelay > CarrierDelay LIMIT 1";
+    testQuery(query);
+    query =
+        "SELECT ArrDelay, CarrierDelay, (ArrDelay - CarrierDelay) AS diff FROM mytable WHERE ArrDelay > CarrierDelay "
+            + "ORDER BY diff, ArrDelay, CarrierDelay LIMIT 100000";
+    testQuery(query);
+    query = "SELECT count(*) FROM mytable WHERE AirlineID > 20355 AND OriginState BETWEEN 'PA' AND 'DE' AND DepTime <> "
+        + "2202 LIMIT 21";
+    testQuery(query);
+    query = "SELECT MAX(Quarter), MAX(FlightNum) FROM mytable LIMIT 8";
+    h2Query = "SELECT MAX(Quarter),MAX(FlightNum) FROM mytable LIMIT 10000";
+    testQuery(query, h2Query);
+    query = "SELECT COUNT(*) FROM mytable WHERE DaysSinceEpoch = 16312 AND Carrier = 'DL'";
+    testQuery(query);
+    query = "SELECT SUM(ArrTime) FROM mytable WHERE DaysSinceEpoch <> 16312 AND Carrier = 'DL'";
+    testQuery(query);
+    query = "SELECT MAX(ArrTime) FROM mytable WHERE DaysSinceEpoch > 16312 AND Carrier = 'DL'";
+    testQuery(query);
+    query = "SELECT MIN(ArrTime) FROM mytable WHERE DaysSinceEpoch >= 16312 AND Carrier = 'DL'";
+    testQuery(query);
+    query = "SELECT COUNT(*) FROM mytable WHERE DaysSinceEpoch < 16312 AND Carrier = 'DL'";
+    testQuery(query);
+    query = "SELECT MAX(ArrTime), MIN(ArrTime) FROM mytable WHERE DaysSinceEpoch <= 16312 AND Carrier = 'DL'";
+    testQuery(query);
+    query = "SELECT COUNT(*), MAX(ArrTime), MIN(ArrTime) FROM mytable WHERE DaysSinceEpoch >= 16312";
+    testQuery(query);
+    query = "SELECT COUNT(*), MAX(ArrTime), MIN(ArrTime), DaysSinceEpoch FROM mytable GROUP BY DaysSinceEpoch";
+    testQuery(query);
+    query = "SELECT DaysSinceEpoch, COUNT(*), MAX(ArrTime), MIN(ArrTime) FROM mytable GROUP BY DaysSinceEpoch";
+    testQuery(query);
+    query = "SELECT ArrTime, ArrTime * 10 FROM mytable WHERE DaysSinceEpoch >= 16312";
+    testQuery(query);
+    query = "SELECT ArrTime, ArrTime - ArrTime % 10 FROM mytable WHERE DaysSinceEpoch >= 16312";
+    testQuery(query);
+    query = "SELECT ArrTime, ArrTime + ArrTime * 9 - ArrTime * 10 FROM mytable WHERE DaysSinceEpoch >= 16312";
+    testQuery(query);
+    query = "SELECT ArrTime, ArrTime + ArrTime * 9 - ArrTime * 10 FROM mytable WHERE ArrTime - 100 > 0";
+    testQuery(query);
+    query = "SELECT COUNT(*) AS \"date\", MAX(ArrTime) AS \"group\", MIN(ArrTime) AS \"min\" FROM mytable";
+    testQuery(query);
+
+    // NOT
+    query = "SELECT count(*) FROM mytable WHERE OriginState NOT BETWEEN 'DE' AND 'PA'";
+    testQuery(query);
+    query = "SELECT count(*) FROM mytable WHERE OriginState NOT LIKE 'A_'";
+    testQuery(query);
+    query = "SELECT count(*) FROM mytable WHERE NOT (DaysSinceEpoch = 16312 AND Carrier = 'DL')";
+    testQuery(query);
+    query = "SELECT count(*) FROM mytable WHERE (NOT DaysSinceEpoch = 16312) AND Carrier = 'DL'";
+    testQuery(query);
+
+    // BETWEEN
+    query = "SELECT count(*) FROM mytable WHERE OriginState BETWEEN 'DE' AND 'PA'";
+    testQuery(query);
+
+    query = "SELECT count(*) FROM mytable WHERE OriginState BETWEEN 'PA' AND 'DE'";
+    testQuery(query);
+
+    query = "SELECT count(*) FROM mytable WHERE DaysSinceEpoch BETWEEN 16312 AND 16318";
+    testQuery(query);
+
+    query = "SELECT Carrier BETWEEN 'AA' AND 'QQ' FROM mytable";
+    testQuery(query);
+
+    query = "SELECT DaysSinceEpoch BETWEEN 16312 AND 16318 FROM mytable";
+    testQuery(query);
+
+    // Post-aggregation in ORDER-BY
+    query = "SELECT MAX(ArrTime) FROM mytable GROUP BY DaysSinceEpoch ORDER BY MAX(ArrTime) - MIN(ArrTime)";
+    testQuery(query);
+    query = "SELECT MAX(ArrDelay), Month FROM mytable GROUP BY Month ORDER BY ABS(Month - 6) + MAX(ArrDelay)";
+    h2Query = "SELECT MAX(ArrDelay), `Month` FROM mytable GROUP BY `Month` ORDER BY ABS(`Month` - 6) + MAX(ArrDelay)";
+    testQuery(query, h2Query);
+
+    // Post-aggregation in SELECT
+    query = "SELECT MAX(ArrDelay) + MAX(AirTime) FROM mytable";
+    testQuery(query);
+    query = "SELECT MAX(ArrDelay) - MAX(AirTime), DaysSinceEpoch FROM mytable GROUP BY DaysSinceEpoch ORDER BY MAX"
+        + "(ArrDelay) - MIN(AirTime) DESC, DaysSinceEpoch";
+    testQuery(query);
+    query = "SELECT DaysSinceEpoch, MAX(ArrDelay) * 2 - MAX(AirTime) - 3 FROM mytable GROUP BY DaysSinceEpoch ORDER BY "
+        + "MAX(ArrDelay) - MIN(AirTime) DESC, DaysSinceEpoch";
+    testQuery(query);
+
+    // Having
+    query = "SELECT COUNT(*) AS Count, DaysSinceEpoch FROM mytable GROUP BY DaysSinceEpoch HAVING Count > 350";
+    testQuery(query);
+    query =
+        "SELECT MAX(ArrDelay) - MAX(AirTime) AS Diff, DaysSinceEpoch FROM mytable GROUP BY DaysSinceEpoch HAVING Diff"
+            + " * 2 > 1000 ORDER BY Diff ASC";
+    testQuery(query);
+    query = "SELECT DaysSinceEpoch, MAX(ArrDelay) - MAX(AirTime) AS Diff FROM mytable GROUP BY DaysSinceEpoch HAVING "
+        + "(Diff >= 300 AND Diff < 500) OR Diff < -500 ORDER BY Diff DESC";
+    testQuery(query);
+
+    // LIKE
+    query = "SELECT count(*) FROM mytable WHERE OriginState LIKE 'A_'";
+    testQuery(query);
+    query = "SELECT count(*) FROM mytable WHERE DestCityName LIKE 'C%'";
+    testQuery(query);
+    query = "SELECT count(*) FROM mytable WHERE DestCityName LIKE '_h%'";
+    testQuery(query);
+
+    // Non-Standard functions
+    // mult is not a standard function.
+    query =
+        "SELECT ArrTime, ArrTime + ArrTime * 9 - ArrTime * 10, ADD(ArrTime + 5, ArrDelay), ADD(ArrTime * 5, ArrDelay)"
+            + " FROM mytable WHERE mult((ArrTime - 100), (5 + ArrDelay))> 0";
+    h2Query =
+        "SELECT ArrTime, ArrTime + ArrTime * 9 - ArrTime * 10, ArrTime + 5 + ArrDelay, ArrTime * 5 + ArrDelay FROM "
+            + "mytable WHERE (ArrTime - 100) * (5 + ArrDelay)> 0";
+    testQuery(query, h2Query);
+
+    // Escape quotes
+    query = "SELECT DistanceGroup FROM mytable WHERE DATE_TIME_CONVERT(DaysSinceEpoch, '1:DAYS:EPOCH', "
+        + "'1:DAYS:SIMPLE_DATE_FORMAT:yyyy-MM-dd''T''HH:mm:ss.SSS''Z''', '1:DAYS') = '2014-09-05T00:00:00.000Z'";
+    h2Query = "SELECT DistanceGroup FROM mytable WHERE DaysSinceEpoch = 16318 LIMIT 10000";
+    testQuery(query, h2Query);
+
+    // DateTimeConverter
+    query = "SELECT dateTimeConvert(DaysSinceEpoch,'1:DAYS:EPOCH','1:HOURS:EPOCH','1:HOURS'), COUNT(*) FROM mytable "
+        + "GROUP BY dateTimeConvert(DaysSinceEpoch,'1:DAYS:EPOCH','1:HOURS:EPOCH','1:HOURS') "
+        + "ORDER BY COUNT(*), dateTimeConvert(DaysSinceEpoch,'1:DAYS:EPOCH','1:HOURS:EPOCH','1:HOURS') DESC";
+    h2Query = "SELECT DaysSinceEpoch * 24, COUNT(*) FROM mytable "
+        + "GROUP BY DaysSinceEpoch * 24 "
+        + "ORDER BY COUNT(*), DaysSinceEpoch DESC";
+    testQuery(query, h2Query);
+
+    // TimeConvert
+    query = "SELECT timeConvert(DaysSinceEpoch,'DAYS','SECONDS'), COUNT(*) FROM mytable "
+        + "GROUP BY timeConvert(DaysSinceEpoch,'DAYS','SECONDS') "
+        + "ORDER BY COUNT(*), timeConvert(DaysSinceEpoch,'DAYS','SECONDS') DESC";
+    h2Query = "SELECT DaysSinceEpoch * 86400, COUNT(*) FROM mytable "
+        + "GROUP BY DaysSinceEpoch * 86400"
+        + "ORDER BY COUNT(*), DaysSinceEpoch * 86400 DESC";
+    testQuery(query, h2Query);
+
+    // test arithmetic operations on date time columns
+    query = "SELECT sub(DaysSinceEpoch,25), COUNT(*) FROM mytable " + "GROUP BY sub(DaysSinceEpoch,25) "
+        + "ORDER BY COUNT(*),sub(DaysSinceEpoch,25) DESC";
+    h2Query = "SELECT DaysSinceEpoch - 25, COUNT(*) FROM mytable " + "GROUP BY DaysSinceEpoch "
+        + "ORDER BY COUNT(*), DaysSinceEpoch DESC";
+    testQuery(query, h2Query);
+
+    // Test aggregation functions in a CaseWhen statement
+    query = "SELECT AirlineID, "
+        + "CASE WHEN Sum(ArrDelay) < 0 THEN 0 WHEN SUM(ArrDelay) > 0 THEN SUM(ArrDelay) END AS SumArrDelay "
+        + "FROM mytable GROUP BY AirlineID";
+    testQuery(query);
+    query = "SELECT CASE WHEN Sum(ArrDelay) < 0 THEN 0 WHEN SUM(ArrDelay) > 0 THEN SUM(ArrDelay) END AS SumArrDelay "
+        + "FROM mytable";
+    testQuery(query);
+
+    // Test CAST
+    query =
+        "SELECT SUM(CAST(CAST(ArrTime AS VARCHAR) AS LONG)) FROM mytable WHERE DaysSinceEpoch <> 16312 AND Carrier = "
+            + "'DL'";
+    testQuery(query);
+    query =
+        "SELECT CAST(CAST(ArrTime AS STRING) AS BIGINT) FROM mytable WHERE DaysSinceEpoch <> 16312 AND Carrier = 'DL' "
+            + "ORDER BY ArrTime DESC";
+    h2Query =
+        "SELECT CAST(CAST(ArrTime AS VARCHAR) AS BIGINT) FROM mytable WHERE DaysSinceEpoch <> 16312 AND Carrier = "
+            + "'DL' ORDER BY ArrTime DESC";
+    testQuery(query, h2Query);
+
+    // Test MIN / MAX on STRING columns (automatically rewritten to MINSTRING / MAXSTRING internally)
+    query = "SELECT MIN(OriginCityName), MAX(OriginCityName) FROM mytable";
+    testQuery("SET autoRewriteAggregationType=true;" + query, query);
+
+    // Test MIN / MAX / SUM on LONG columns (automatically rewritten to MINLONG / MAXLONG / SUMLONG internally)
+    query = "SELECT MIN(AirlineID), MAX(AirlineID), SUM(AirlineID) FROM mytable";
+    testQuery(query);
+
+    // Test orderedPreferredPools option which will fallbacks to non preferred Pools
+    // when non of preferred Pools is available
+    query = "SELECT count(*) FROM mytable WHERE OriginState LIKE 'A_' option(orderedPreferredPools=0|1)";
+    h2Query = "SELECT count(*) FROM mytable WHERE OriginState LIKE 'A_'";
+    testQuery(query, h2Query);
+    query = "SET orderedPreferredPools='0 | 1'; SELECT count(*) FROM mytable WHERE OriginState LIKE 'A_'";
+    h2Query = "SELECT count(*) FROM mytable WHERE OriginState LIKE 'A_'";
+    testQuery(query, h2Query);
+  }
+
+  private void testHardcodedQueriesV2()
+      throws Exception {
+    String query;
+    String h2Query;
+
+    query =
+        "SELECT DistanceGroup FROM mytable WHERE \"Month\" BETWEEN 1 AND 1 AND arrayToMV(DivAirportSeqIDs) IN "
+            + "(1078102, 1142303, 1530402, 1172102, 1291503) OR SecurityDelay IN (1, 0, 14, -9999) LIMIT 10";
+    h2Query =
+        "SELECT DistanceGroup FROM mytable WHERE `Month` BETWEEN 1 AND 1 AND (DivAirportSeqIDs[1] IN (1078102, "
+            + "1142303, 1530402, 1172102, 1291503) OR DivAirportSeqIDs[2] IN (1078102, 1142303, 1530402, 1172102, "
+            + "1291503) OR DivAirportSeqIDs[3] IN (1078102, 1142303, 1530402, 1172102, 1291503) OR "
+            + "DivAirportSeqIDs[4] IN (1078102, 1142303, 1530402, 1172102, 1291503) OR DivAirportSeqIDs[5] IN "
+            + "(1078102, 1142303, 1530402, 1172102, 1291503)) OR SecurityDelay IN (1, 0, 14, -9999) LIMIT 10000";
+    testQuery(query, h2Query);
+
+    query = "SELECT MIN(ArrDelayMinutes), AVG(CAST(DestCityMarketID AS DOUBLE)) FROM mytable WHERE DivArrDelay < 196";
+    h2Query =
+        "SELECT MIN(CAST(`ArrDelayMinutes` AS DOUBLE)), AVG(CAST(`DestCityMarketID` AS DOUBLE)) FROM mytable WHERE "
+            + "`DivArrDelay` < 196";
+    testQuery(query, h2Query);
+  }
+
+  private void testHardCodedQueriesV1()
+      throws Exception {
+    // Non-Standard SQL syntax:
+    // IN_ID_SET
+    {
+      IdSet idSet = IdSets.create(FieldSpec.DataType.LONG);
+      idSet.add(19690L);
+      idSet.add(20355L);
+      idSet.add(21171L);
+      // Also include a non-existing id
+      idSet.add(0L);
+      String serializedIdSet = idSet.toBase64String();
+      String inIdSetQuery = "SELECT COUNT(*) FROM mytable WHERE INIDSET(AirlineID, '" + serializedIdSet + "') = 1";
+      String inQuery = "SELECT COUNT(*) FROM mytable WHERE AirlineID IN (19690, 20355, 21171, 0)";
+      testQuery(inIdSetQuery, inQuery);
+      String notInIdSetQuery = "SELECT COUNT(*) FROM mytable WHERE INIDSET(AirlineID, '" + serializedIdSet + "') = 0";
+      String notInQuery = "SELECT COUNT(*) FROM mytable WHERE AirlineID NOT IN (19690, 20355, 21171, 0)";
+      testQuery(notInIdSetQuery, notInQuery);
+    }
+
+    // IN_SUBQUERY
+    {
+      String inSubqueryQuery =
+          "SELECT COUNT(*) FROM mytable WHERE INSUBQUERY(DestAirportID, 'SELECT IDSET(DestAirportID) FROM mytable "
+              + "WHERE DaysSinceEpoch = 16430') = 1";
+      String inQuery = "SELECT COUNT(*) FROM mytable WHERE DestAirportID IN (SELECT DestAirportID FROM mytable WHERE "
+          + "DaysSinceEpoch = 16430)";
+      testQuery(inSubqueryQuery, inQuery);
+
+      String notInSubqueryQuery =
+          "SELECT COUNT(*) FROM mytable WHERE INSUBQUERY(DestAirportID, 'SELECT IDSET(DestAirportID) FROM mytable "
+              + "WHERE DaysSinceEpoch = 16430') = 0";
+      String notInQuery =
+          "SELECT COUNT(*) FROM mytable WHERE DestAirportID NOT IN (SELECT DestAirportID FROM mytable WHERE "
+              + "DaysSinceEpoch = 16430)";
+      testQuery(notInSubqueryQuery, notInQuery);
+    }
+  }
+
+  /// Test hardcoded queries on server partitioned data (all the segments for a partition is served by a single server).
+  public void testHardcodedServerPartitionedSqlQueries()
+      throws Exception {
+    // IN_PARTITIONED_SUBQUERY
+    {
+      String inPartitionedSubqueryQuery =
+          "SELECT COUNT(*) FROM mytable WHERE INPARTITIONEDSUBQUERY(DestAirportID, 'SELECT IDSET(DestAirportID) FROM "
+              + "mytable WHERE DaysSinceEpoch = 16430') = 1";
+      String inQuery = "SELECT COUNT(*) FROM mytable WHERE DestAirportID IN (SELECT DestAirportID FROM mytable WHERE "
+          + "DaysSinceEpoch = 16430)";
+      testQuery(inPartitionedSubqueryQuery, inQuery);
+
+      String notInPartitionedSubqueryQuery =
+          "SELECT COUNT(*) FROM mytable WHERE INPARTITIONEDSUBQUERY(DestAirportID, 'SELECT IDSET(DestAirportID) FROM "
+              + "mytable WHERE DaysSinceEpoch = 16430') = 0";
+      String notInQuery =
+          "SELECT COUNT(*) FROM mytable WHERE DestAirportID NOT IN (SELECT DestAirportID FROM mytable WHERE "
+              + "DaysSinceEpoch = 16430)";
+      testQuery(notInPartitionedSubqueryQuery, notInQuery);
+    }
+  }
+
+  /// Test to ensure that broker response contains expected stats
+  ///
+  /// @throws Exception
+  public void testBrokerResponseMetadata()
+      throws Exception {
+    String[] queries = new String[]{
+        // matching query
+        "SELECT count(*) FROM mytable",
+        // query that does not match any row
+        "SELECT count(*) FROM mytable where non_existing_column='non_existing_value'",
+        // query a non existing table
+        "SELECT count(*) FROM mytable_foo"
+    };
+    String[] statNames = new String[]{
+        "totalDocs", "numServersQueried", "numServersResponded", "numSegmentsQueried", "numSegmentsProcessed",
+        "numSegmentsMatched", "numDocsScanned", "totalDocs", "timeUsedMs", "numEntriesScannedInFilter",
+        "numEntriesScannedPostFilter"
+    };
+
+    for (String query : queries) {
+      JsonNode response = postQuery(query);
+      for (String statName : statNames) {
+        assertTrue(response.has(statName), "Response does not contain stat: " + statName);
+      }
+    }
+  }
+
+  public void testVirtualColumnQueries() {
+    // Check that there are no virtual columns in the query results
+    ResultSetGroup resultSetGroup = getPinotConnection().execute("select * from mytable");
+    ResultSet resultSet = resultSetGroup.getResultSet(0);
+    for (int i = 0; i < resultSet.getColumnCount(); i++) {
+      assertFalse(resultSet.getColumnName(i).startsWith("$"),
+          "Virtual column " + resultSet.getColumnName(i) + " is present in the results!");
+    }
+
+    // Check that the virtual columns work as expected (throws no exceptions)
+    getPinotConnection().execute("select $docId, $segmentName, $hostName, $partitionId from mytable");
+    getPinotConnection().execute(
+        "select $docId, $segmentName, $hostName, $partitionId from mytable where $docId < 5 limit 50");
+    getPinotConnection().execute(
+        "select $docId, $segmentName, $hostName, $partitionId from mytable where $docId = 5 limit 50");
+    getPinotConnection().execute(
+        "select $docId, $segmentName, $hostName, $partitionId from mytable where $docId > 19998 limit 50");
+
+    // Segment metadata virtual columns. This method is the only place they are exercised against a table that can
+    // have CONSUMING segments, so assert the results rather than just checking that nothing throws.
+    long numTotalDocs = getCountStarResult();
+
+    // $totalDocs is the number of documents stored in the segment. On a hybrid table the broker's time boundary can
+    // hide some of them, so a segment's $totalDocs is at least the number of rows the query sees from it, never less.
+    ResultSet perSegment = getPinotConnection().execute(
+            "select $segmentName, max($totalDocs), count(*) from mytable group by $segmentName limit 10000")
+        .getResultSet(0);
+    assertTrue(perSegment.getRowCount() > 0);
+    long visibleRows = 0;
+    for (int i = 0; i < perSegment.getRowCount(); i++) {
+      String segmentName = perSegment.getString(i, 0);
+      // MAX()/COUNT() render as floating point values in the single-stage engine, so read them as doubles in both
+      long totalDocsInSegment = (long) Double.parseDouble(perSegment.getString(i, 1));
+      long rowsFromSegment = (long) Double.parseDouble(perSegment.getString(i, 2));
+      assertTrue(totalDocsInSegment > 0, "Unexpected $totalDocs: " + totalDocsInSegment + " for: " + segmentName);
+      assertTrue(totalDocsInSegment >= rowsFromSegment,
+          "$totalDocs: " + totalDocsInSegment + " is below the " + rowsFromSegment + " rows returned by: "
+              + segmentName);
+      visibleRows += rowsFromSegment;
+    }
+    assertEquals(visibleRows, numTotalDocs, "Grouping by $segmentName should cover every row exactly once");
+
+    // Every segment - CONSUMING included - is created with a creation time, so none of them falls back to the epoch
+    // placeholder used when the metadata is unavailable
+    ResultSet creationTimes = getPinotConnection()
+        .execute("select $segmentName, $creationTime from mytable group by $segmentName, $creationTime limit 10000")
+        .getResultSet(0);
+    assertTrue(creationTimes.getRowCount() > 0);
+    for (int i = 0; i < creationTimes.getRowCount(); i++) {
+      String creationTime = creationTimes.getString(i, 1);
+      assertTrue(Timestamp.valueOf(creationTime).getTime() > 0,
+          "Unexpected $creationTime: " + creationTime + " for segment: " + creationTimes.getString(i, 0));
+    }
+
+    // Selecting them must not fail on any segment type
+    getPinotConnection().execute("select $creationTime, $startTime, $endTime, $totalDocs, $crc from mytable limit 50");
+  }
+
+  /// Test queries from the query file.
+  public void testQueriesFromQueryFile()
+      throws Exception {
+    InputStream inputStream =
+        BaseClusterIntegrationTestSet.class.getClassLoader().getResourceAsStream(getQueryFileName());
+    assertNotNull(inputStream);
+
+    try (BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream))) {
+      String queryString;
+      while ((queryString = reader.readLine()) != null) {
+        // Skip commented line and empty line.
+        queryString = queryString.trim();
+        if (queryString.startsWith("#") || queryString.isEmpty()) {
+          continue;
+        }
+
+        JsonNode query = JsonUtils.stringToJsonNode(queryString);
+        String pinotQuery = query.get("sql").asText();
+        JsonNode hsqls = query.get("hsqls");
+        String h2Query;
+        if (hsqls == null || hsqls.isEmpty()) {
+          h2Query = pinotQuery;
+        } else {
+          h2Query = hsqls.get(0).asText();
+        }
+        try {
+          testQuery(pinotQuery, h2Query);
+        } catch (Exception e) {
+          e.printStackTrace();
+          LOGGER.error("Failed to test Pinot query: {} with H2 query: {}.", pinotQuery, h2Query, e);
+          throw e;
+        }
+      }
+    }
+  }
+
+  /// Test queries generated by query generator.
+  ///
+  /// @throws Exception
+  public void testGeneratedQueries()
+      throws Exception {
+    // default test with MV columns, without using multistage engine
+    testGeneratedQueries(true, false);
+  }
+
+  protected void testGeneratedQueries(boolean withMultiValues, boolean useMultistageEngine)
+      throws Exception {
+    QueryGenerator queryGenerator = getQueryGenerator();
+    queryGenerator.setSkipMultiValuePredicates(!withMultiValues);
+    queryGenerator.setUseMultistageEngine(useMultistageEngine);
+    int numQueriesToGenerate = getNumQueriesToGenerate();
+    for (int i = 0; i < numQueriesToGenerate; i++) {
+      QueryGenerator.Query query = queryGenerator.generateQuery();
+      if (useMultistageEngine) {
+        if (withMultiValues) {
+          // For multistage query with MV columns, we need to use Pinot query string for testing.
+          testQuery(query.generatePinotQuery().replace("`", "\""), query.generateH2Query());
+        } else {
+          // multistage engine follows standard SQL thus should use H2 query string for testing.
+          testQuery(query.generateH2Query().replace("`", "\""), query.generateH2Query());
+        }
+      } else {
+        testQuery(query.generatePinotQuery(), query.generateH2Query());
+      }
+    }
+  }
+
+  /// Test if routing table get updated when instance is shutting down.
+  ///
+  /// @throws Exception
+  public void testInstanceShutdown()
+      throws Exception {
+    List<String> instances = _helixAdmin.getInstancesInCluster(getHelixClusterName());
+    assertFalse(instances.isEmpty(), "List of instances should not be empty");
+
+    // Mark all instances in the cluster as shutting down
+    for (String instance : instances) {
+      InstanceConfig instanceConfig = _helixAdmin.getInstanceConfig(getHelixClusterName(), instance);
+      instanceConfig.getRecord().setBooleanField(CommonConstants.Helix.IS_SHUTDOWN_IN_PROGRESS, true);
+      _helixAdmin.setInstanceConfig(getHelixClusterName(), instance, instanceConfig);
+    }
+
+    // Check that the routing table is empty
+    checkForEmptyRoutingTable(true);
+
+    // Mark all instances as not shutting down
+    for (String instance : instances) {
+      InstanceConfig instanceConfig = _helixAdmin.getInstanceConfig(getHelixClusterName(), instance);
+      instanceConfig.getRecord().setBooleanField(CommonConstants.Helix.IS_SHUTDOWN_IN_PROGRESS, false);
+      _helixAdmin.setInstanceConfig(getHelixClusterName(), instance, instanceConfig);
+    }
+
+    // Check that the routing table is not empty
+    checkForEmptyRoutingTable(false);
+
+    // Check on each server instance
+    for (String instance : instances) {
+      if (!InstanceTypeUtils.isServer(instance)) {
+        continue;
+      }
+
+      // Ensure that the random instance is in the routing table
+      checkForInstanceInRoutingTable(instance, true);
+
+      // Mark the server instance as shutting down
+      InstanceConfig instanceConfig = _helixAdmin.getInstanceConfig(getHelixClusterName(), instance);
+      instanceConfig.getRecord().setBooleanField(CommonConstants.Helix.IS_SHUTDOWN_IN_PROGRESS, true);
+      _helixAdmin.setInstanceConfig(getHelixClusterName(), instance, instanceConfig);
+
+      // Check that it is not in the routing table
+      checkForInstanceInRoutingTable(instance, false);
+
+      // Re-enable the server instance
+      instanceConfig.getRecord().setBooleanField(CommonConstants.Helix.IS_SHUTDOWN_IN_PROGRESS, false);
+      _helixAdmin.setInstanceConfig(getHelixClusterName(), instance, instanceConfig);
+
+      // Check that it is in the routing table
+      checkForInstanceInRoutingTable(instance, true);
+    }
+  }
+
+  /// Test that:
+  ///
+  /// 1. setting `queriesDisabled` via the controller API removes and re-adds a server from broker routing;
+  /// 2. concurrent field-scoped updates to `shutdownInProgress` do not clobber `queriesDisabled`;
+  /// 3. a full-record `PUT /instances/{name}` (updateInstance) does NOT clobber the operational
+  ///    `queriesDisabled` flag, even when the request body's default value is `false`.
+  public void testQueriesDisabled()
+      throws Exception {
+    List<String> instances = _helixAdmin.getInstancesInCluster(getHelixClusterName());
+    // Iterate over all servers to find one that actually appears in the routing table for {@code getTableName()}.
+    // Picking the first server unconditionally can be flaky when multiple servers exist with different tags
+    // (e.g. hybrid clusters with offline/realtime tenants).
+    String serverInstance = null;
+    for (String candidate : instances) {
+      if (!InstanceTypeUtils.isServer(candidate)) {
+        continue;
+      }
+      if (isInstanceInRoutingTable(candidate)) {
+        serverInstance = candidate;
+        break;
+      }
+    }
+    assertNotNull(serverInstance,
+        "No server instance found in routing table for table: " + getTableName() + "; instances: " + instances);
+    HelixConfigScope scope =
+        new HelixConfigScopeBuilder(HelixConfigScope.ConfigScopeProperty.PARTICIPANT, getHelixClusterName())
+            .forParticipant(serverInstance).build();
+    try {
+      // Server should be in routing initially
+      checkForInstanceInRoutingTable(serverInstance, true);
+
+      // Disable query routing via the controller API
+      getOrCreateAdminClient().getInstanceClient().updateInstanceState(serverInstance, "QUERIES_DISABLE");
+
+      // Server should leave routing
+      checkForInstanceInRoutingTable(serverInstance, false);
+
+      // Re-enable query routing
+      getOrCreateAdminClient().getInstanceClient().updateInstanceState(serverInstance, "QUERIES_ENABLE");
+
+      // Server should re-enter routing
+      checkForInstanceInRoutingTable(serverInstance, true);
+
+      // Interleaving test: set queriesDisabled, then set shutdownInProgress, then clear shutdownInProgress.
+      // queriesDisabled must still be set (i.e. the server must remain out of routing) because we use
+      // field-scoped writes that do not clobber each other.
+      getOrCreateAdminClient().getInstanceClient().updateInstanceState(serverInstance, "QUERIES_DISABLE");
+      checkForInstanceInRoutingTable(serverInstance, false);
+
+      _helixAdmin.setConfig(scope,
+          Map.of(CommonConstants.Helix.IS_SHUTDOWN_IN_PROGRESS, Boolean.TRUE.toString()));
+      checkForInstanceInRoutingTable(serverInstance, false);
+
+      _helixAdmin.setConfig(scope,
+          Map.of(CommonConstants.Helix.IS_SHUTDOWN_IN_PROGRESS, Boolean.FALSE.toString()));
+
+      // queriesDisabled was set via a separate field-scoped write, so the server must still be out of routing
+      checkForInstanceInRoutingTable(serverInstance, false);
+
+      // Full-record updateInstance test: round-trip the live config through PUT /instances/{name} with the
+      // request body's {@code queriesDisabled} defaulted to false. The operational flag must NOT be cleared,
+      // since it is owned by /state?state=QUERIES_DISABLE|QUERIES_ENABLE.
+      InstanceConfig liveInstanceConfig = _helixAdmin.getInstanceConfig(getHelixClusterName(), serverInstance);
+      Instance instanceBody = InstanceUtils.toInstance(liveInstanceConfig);
+      // Force the request-body flag to false to simulate an operator updating host/tags/ports without realizing
+      // that queriesDisabled is operationally owned by a different API.
+      Instance updateBody = new Instance(instanceBody.getHost(), instanceBody.getPort(), instanceBody.getType(),
+          instanceBody.getTags(), instanceBody.getPools(), instanceBody.getGrpcPort(), instanceBody.getAdminPort(),
+          instanceBody.getQueryServicePort(), instanceBody.getQueryMailboxPort(), false);
+      getOrCreateAdminClient().getInstanceClient().updateInstance(serverInstance, updateBody.toJsonString());
+      // Operational flag must survive a request-body-driven update.
+      checkForInstanceInRoutingTable(serverInstance, false);
+    } finally {
+      // Defensive cleanup: restore the server to the routing-eligible state regardless of which assertion failed.
+      // Each cleanup step is wrapped so a primary assertion failure isn't masked by a cleanup throw.
+      try {
+        getOrCreateAdminClient().getInstanceClient().updateInstanceState(serverInstance, "QUERIES_ENABLE");
+      } catch (Exception ignored) {
+      }
+      try {
+        _helixAdmin.setConfig(scope,
+            Map.of(CommonConstants.Helix.IS_SHUTDOWN_IN_PROGRESS, Boolean.FALSE.toString()));
+      } catch (Exception ignored) {
+      }
+    }
+    // Verify routing is restored after cleanup.
+    checkForInstanceInRoutingTable(serverInstance, true);
+  }
+
+  /// Non-waiting check for whether `instance` appears in any routing table for the current table.
+  /// Used by [#testQueriesDisabled()] to pick a server that is actually serving queries.
+  private boolean isInstanceInRoutingTable(String instance) {
+    try {
+      JsonNode routingTables = getDebugInfo("debug/routingTable/" + getTableName());
+      for (JsonNode routingTable : routingTables) {
+        if (routingTable.has(instance)) {
+          return true;
+        }
+      }
+    } catch (Exception ignored) {
+      // Routing table not yet populated; treat as not present.
+    }
+    return false;
+  }
+
+  private void checkForInstanceInRoutingTable(String instance, boolean shouldExist) {
+    String errorMessage;
+    if (shouldExist) {
+      errorMessage = "Routing table does not contain expected instance: " + instance;
+    } else {
+      errorMessage = "Routing table contains unexpected instance: " + instance;
+    }
+    TestUtils.waitForCondition(aVoid -> {
+      try {
+        JsonNode routingTables = getDebugInfo("debug/routingTable/" + getTableName());
+        for (JsonNode routingTable : routingTables) {
+          if (routingTable.has(instance)) {
+            return shouldExist;
+          }
+        }
+        return !shouldExist;
+      } catch (Exception e) {
+        return null;
+      }
+    }, 60_000L, errorMessage);
+  }
+
+  private void checkForEmptyRoutingTable(boolean shouldBeEmpty) {
+    String errorMessage;
+    if (shouldBeEmpty) {
+      errorMessage = "Routing table is not empty";
+    } else {
+      errorMessage = "Routing table is empty";
+    }
+    TestUtils.waitForCondition(aVoid -> {
+      try {
+        JsonNode routingTables = getDebugInfo("debug/routingTable/" + getTableName());
+        for (JsonNode routingTable : routingTables) {
+          if ((routingTable.isEmpty()) != shouldBeEmpty) {
+            return false;
+          }
+        }
+        return true;
+      } catch (Exception e) {
+        return null;
+      }
+    }, 60_000L, errorMessage);
+  }
+
+  public void testReset(TableType tableType) {
+    String rawTableName = getTableName();
+    String tableNameWithType = TableNameBuilder.forType(tableType).tableNameWithType(rawTableName);
+
+    // Reset the table.
+    // NOTE: Reset table might fail if there are pending messages, so we need to retry until it succeeds.
+    TestUtils.waitForCondition(aVoid -> {
+      try {
+        resetTable(rawTableName, tableType, null);
+        return true;
+      } catch (IOException e) {
+        assertTrue(e.toString().contains("pending message"), "Got unexpected exception: " + e);
+        return false;
+      }
+    }, 30_000L, "Failed to reset table: " + tableNameWithType);
+
+    // Wait for all the reset messages being processed.
+    IdealState idealState = _helixResourceManager.getTableIdealState(tableNameWithType);
+    assertNotNull(idealState, "Failed to find ideal state for table: " + tableNameWithType);
+    Set<String> instances = new HashSet<>();
+    for (Map<String, String> instanceStateMap : idealState.getRecord().getMapFields().values()) {
+      instances.addAll(instanceStateMap.keySet());
+    }
+    PropertyKey.Builder keyBuilder = _helixDataAccessor.keyBuilder();
+    TestUtils.waitForCondition(aVoid -> {
+      for (String instanceName : instances) {
+        if (!_helixDataAccessor.getChildNames(keyBuilder.messages(instanceName)).isEmpty()) {
+          return false;
+        }
+      }
+      return true;
+    }, 30_000L, "Failed to process all the reset messages");
+
+    // Wait for external view converging with ideal state.
+    TestUtils.waitForCondition(aVoid -> {
+      IdealState is = _helixResourceManager.getTableIdealState(tableNameWithType);
+      assertNotNull(is, "Failed to find ideal state for table: " + tableNameWithType);
+      ExternalView ev = _helixResourceManager.getTableExternalView(tableNameWithType);
+      assertNotNull(ev, "Failed to find external view for table: " + tableNameWithType);
+      return ev.getRecord().getMapFields().equals(is.getRecord().getMapFields());
+    }, 30_000L, "Failed to match the ideal state");
+  }
+
+  public String reloadTableAndValidateResponse(String tableName, TableType tableType, boolean forceDownload)
+      throws Exception {
+    String response =
+        getOrCreateAdminClient().getSegmentClient().reloadTable(tableName, tableType.name(), forceDownload);
+    String tableNameWithType = TableNameBuilder.forType(tableType).tableNameWithType(tableName);
+    JsonNode responseJson = JsonUtils.stringToJsonNode(response);
+    JsonNode tableLevelDetails = JsonUtils.stringToJsonNode(responseJson.get("status").asText()).get(tableNameWithType);
+    String isZKWriteSuccess = tableLevelDetails.get("reloadJobMetaZKStorageStatus").asText();
+    assertEquals(isZKWriteSuccess, "SUCCESS");
+    String jobId = tableLevelDetails.get("reloadJobId").asText();
+    PinotTableReloadStatusResponse jobStatus =
+        getOrCreateAdminClient().getSegmentClient().getSegmentReloadStatusObject(jobId);
+
+    // Validate all fields are present
+    assertEquals(jobStatus.getMetadata().getJobId(), jobId);
+    assertEquals(jobStatus.getMetadata().getJobType(), "RELOAD_SEGMENT");
+    assertEquals(jobStatus.getMetadata().getTableNameWithType(), tableNameWithType);
+    return jobId;
+  }
+
+  public boolean isReloadJobCompleted(String reloadJobId)
+      throws Exception {
+    PinotTableReloadStatusResponse jobStatus = getOrCreateAdminClient().getSegmentClient()
+        .getSegmentReloadStatusObject(reloadJobId);
+
+    assertEquals(jobStatus.getMetadata().getJobId(), reloadJobId);
+    assertEquals(jobStatus.getMetadata().getJobType(), "RELOAD_SEGMENT");
+    return jobStatus.getTotalSegmentCount() == jobStatus.getSuccessCount();
+  }
+
+  /// TODO: Unify this and [OfflineClusterIntegrationTest#testDefaultColumns(boolean)]
+  public void testReload(boolean includeOfflineTable)
+      throws Exception {
+    testReload(includeOfflineTable, false);
+    testReload(includeOfflineTable, true);
+  }
+
+  private void testReload(boolean includeOfflineTable, boolean forceDownload)
+      throws Exception {
+    String rawTableName = getTableName();
+    Schema oldSchema = getSchema(rawTableName);
+
+    String selectStarQuery = "SELECT * FROM " + rawTableName;
+    JsonNode queryResponse = postQuery(selectStarQuery);
+    assertEquals(queryResponse.get("resultTable").get("dataSchema").get("columnNames").size(), oldSchema.size());
+    long numTotalDocs = queryResponse.get("totalDocs").asLong();
+
+    Schema newSchema = createSchema();
+    addNewSchemaFields(newSchema);
+
+    // Without reload, select star should be able to include new added columns after schema change is propagated to both
+    // broker and server
+    TestUtils.waitForCondition(aVoid -> {
+      try {
+        JsonNode testQueryResponse = postQuery(selectStarQuery);
+        // If schema change is propagated to broker before server, server might not be able to find the column for a
+        // short period of time
+        if (!testQueryResponse.get("exceptions").isEmpty()) {
+          return false;
+        }
+        return testQueryResponse.get("resultTable").get("dataSchema").get("columnNames").size() == newSchema.size();
+      } catch (Exception e) {
+        throw new RuntimeException(e);
+      }
+    }, 60_000L, "Failed to generate default virtual columns without reload");
+
+    // Test reload needed, and trigger reload
+    String realtimeTableName = TableNameBuilder.forType(TableType.REALTIME).tableNameWithType(rawTableName);
+    testTableNeedReload(realtimeTableName, true);
+    String realtimeReloadJobId = reloadTableAndValidateResponse(rawTableName, TableType.REALTIME, forceDownload);
+    String offlineTableName = TableNameBuilder.forType(TableType.OFFLINE).tableNameWithType(rawTableName);
+    String offlineReloadJobId;
+    if (includeOfflineTable) {
+      testTableNeedReload(offlineTableName, true);
+      offlineReloadJobId = reloadTableAndValidateResponse(rawTableName, TableType.OFFLINE, forceDownload);
+    } else {
+      offlineReloadJobId = null;
+    }
+
+    // Wait for reload job to finish
+    TestUtils.waitForCondition(aVoid -> {
+      try {
+        JsonNode testQueryResponse = postQuery(selectStarQuery);
+        // Should not throw exception during reload
+        assertEquals(testQueryResponse.get("exceptions").size(), 0,
+            String.format("Found exceptions when testing reload for query: %s and response: %s", selectStarQuery,
+                testQueryResponse));
+        // Total docs should not change during reload
+        assertEquals(testQueryResponse.get("totalDocs").asLong(), numTotalDocs,
+            String.format("Total docs changed after reload, query: %s and response: %s", selectStarQuery,
+                testQueryResponse));
+        assertEquals(testQueryResponse.get("resultTable").get("dataSchema").get("columnNames").size(),
+            newSchema.size());
+        return isReloadJobCompleted(realtimeReloadJobId) && (offlineReloadJobId == null || isReloadJobCompleted(
+            offlineReloadJobId));
+      } catch (Exception e) {
+        throw new RuntimeException(e);
+      }
+    }, 600_000L, "Failed to finish reload job");
+
+    // Test reload not needed after previous reload completed
+    testTableNeedReload(realtimeTableName, false);
+    if (includeOfflineTable) {
+      testTableNeedReload(offlineTableName, false);
+    }
+
+    // Test filter on all newly added columns
+    String filterQuery = "SELECT COUNT(*) FROM " + rawTableName
+        + " WHERE NewIntSVDimension < 0 AND NewLongSVDimension < 0 AND NewFloatSVDimension < 0 AND "
+        + "NewDoubleSVDimension < 0 AND NewStringSVDimension = 'null' AND NewIntMVDimension < 0 AND "
+        + "NewLongMVDimension < 0 AND NewFloatMVDimension < 0 AND NewDoubleMVDimension < 0 AND "
+        + "NewStringMVDimension = 'null' AND NewIntMetric = 0 AND NewLongMetric = 0 AND NewFloatMetric = 0 "
+        + "AND NewDoubleMetric = 0 AND NewBytesMetric = ''";
+    queryResponse = postQuery(filterQuery);
+    assertTrue(queryResponse.get("exceptions").isEmpty());
+    assertEquals(queryResponse.get("totalDocs").asLong(), numTotalDocs);
+    assertEquals(queryResponse.get("resultTable").get("rows").get(0).get(0).asLong(), getCountStarResult());
+
+    // Remove the extra columns
+    forceUpdateSchema(oldSchema);
+
+    // Wait for schema change being propagated to broker
+    TestUtils.waitForCondition(aVoid -> {
+      try {
+        JsonNode testQueryResponse = postQuery(selectStarQuery);
+        // If schema change is propagated to server before broker, server might not be able to find the column for a
+        // short period of time
+        if (!testQueryResponse.get("exceptions").isEmpty()) {
+          return false;
+        }
+        return testQueryResponse.get("resultTable").get("dataSchema").get("columnNames").size() == oldSchema.size();
+      } catch (Exception e) {
+        throw new RuntimeException(e);
+      }
+    }, 60_000L, "Failed to propagate schema change to broker");
+
+    // Test reload needed, and trigger reload
+    testTableNeedReload(realtimeTableName, true);
+    String realtimeReloadJobId2 = reloadTableAndValidateResponse(rawTableName, TableType.REALTIME, forceDownload);
+    String offlineReloadJobId2;
+    if (includeOfflineTable) {
+      testTableNeedReload(offlineTableName, true);
+      offlineReloadJobId2 = reloadTableAndValidateResponse(rawTableName, TableType.OFFLINE, forceDownload);
+    } else {
+      offlineReloadJobId2 = null;
+    }
+
+    // Wait for reload job to finish
+    TestUtils.waitForCondition(aVoid -> {
+      try {
+        JsonNode testQueryResponse = postQuery(selectStarQuery);
+        // Should not throw exception during reload
+        assertEquals(testQueryResponse.get("exceptions").size(), 0,
+            String.format("Found exceptions when testing reload for query: %s and response: %s", selectStarQuery,
+                testQueryResponse));
+        // Total docs should not change during reload
+        assertEquals(testQueryResponse.get("totalDocs").asLong(), numTotalDocs,
+            String.format("Total docs changed after reload, query: %s and response: %s", selectStarQuery,
+                testQueryResponse));
+        assertEquals(testQueryResponse.get("resultTable").get("dataSchema").get("columnNames").size(),
+            oldSchema.size());
+        return isReloadJobCompleted(realtimeReloadJobId2) && (offlineReloadJobId2 == null || isReloadJobCompleted(
+            offlineReloadJobId2));
+      } catch (Exception e) {
+        throw new RuntimeException(e);
+      }
+    }, 600_000L, "Failed to finish reload job");
+
+    // Test reload not needed after previous reload completed
+    testTableNeedReload(realtimeTableName, false);
+    if (includeOfflineTable) {
+      testTableNeedReload(offlineTableName, false);
+    }
+  }
+
+  private void addNewSchemaFields(Schema schema)
+      throws IOException {
+    schema.addField(constructNewDimension(FieldSpec.DataType.INT, true));
+    schema.addField(constructNewDimension(FieldSpec.DataType.LONG, true));
+    schema.addField(constructNewDimension(FieldSpec.DataType.FLOAT, true));
+    schema.addField(constructNewDimension(FieldSpec.DataType.DOUBLE, true));
+    schema.addField(constructNewDimension(FieldSpec.DataType.STRING, true));
+    schema.addField(constructNewDimension(FieldSpec.DataType.INT, false));
+    schema.addField(constructNewDimension(FieldSpec.DataType.LONG, false));
+    schema.addField(constructNewDimension(FieldSpec.DataType.FLOAT, false));
+    schema.addField(constructNewDimension(FieldSpec.DataType.DOUBLE, false));
+    schema.addField(constructNewDimension(FieldSpec.DataType.STRING, false));
+    schema.addField(constructNewMetric(FieldSpec.DataType.INT));
+    schema.addField(constructNewMetric(FieldSpec.DataType.LONG));
+    schema.addField(constructNewMetric(FieldSpec.DataType.FLOAT));
+    schema.addField(constructNewMetric(FieldSpec.DataType.DOUBLE));
+    schema.addField(constructNewMetric(FieldSpec.DataType.BYTES));
+    // Upload the schema with extra columns
+    updateSchema(schema);
+  }
+
+  private void testTableNeedReload(String tableNameWithType, boolean expectedNeedReload)
+      throws IOException {
+    TableSegmentsReloadCheckResponse responseNoVerbose = checkIfReloadIsNeeded(tableNameWithType, false);
+    TableSegmentsReloadCheckResponse responseVerbose = checkIfReloadIsNeeded(tableNameWithType, true);
+    // Tests if reload is needed on the table
+    assertEquals(responseNoVerbose.isNeedReload(), expectedNeedReload);
+    assertEquals(responseVerbose.isNeedReload(), expectedNeedReload);
+    assertFalse(responseVerbose.getServerToSegmentsCheckReloadList().isEmpty());
+  }
+
+  private DimensionFieldSpec constructNewDimension(FieldSpec.DataType dataType, boolean singleValue) {
+    String column =
+        "New" + StringUtils.capitalize(dataType.toString().toLowerCase()) + (singleValue ? "SV" : "MV") + "Dimension";
+    return new DimensionFieldSpec(column, dataType, singleValue);
+  }
+
+  private MetricFieldSpec constructNewMetric(FieldSpec.DataType dataType) {
+    String column = "New" + StringUtils.capitalize(dataType.toString().toLowerCase()) + "Metric";
+    return new MetricFieldSpec(column, dataType);
+  }
+
+  protected RebalanceResult triggerTableRebalance(RebalanceConfig rebalanceConfig, TableType tableType)
+      throws IOException, PinotAdminException {
+    Map<String, String> queryParams = new HashMap<>();
+    queryParams.put("type", tableType.toString());
+    String[] params = rebalanceConfig.toQueryString().split("&");
+    for (String param : params) {
+      String[] kv = param.split("=", 2);
+      if (kv.length == 2) {
+        queryParams.put(kv[0], kv[1]);
+      }
+    }
+    return getOrCreateAdminClient().getRebalanceClient()
+        .rebalanceTableObject(getTableName(), queryParams);
+  }
+
+  @Deprecated
+  protected String getTableRebalanceUrl(RebalanceConfig rebalanceConfig, TableType tableType) {
+    return controllerUrl(StringUtil.join("/", "tables", getTableName(), "rebalance"))
+        + "?type=" + tableType + "&" + rebalanceConfig.toQueryString();
+  }
+
+  protected void waitForRebalanceToComplete(String rebalanceJobId, long timeoutMs) {
+    TestUtils.waitForCondition(aVoid -> {
+      try {
+        ServerRebalanceJobStatusResponse rebalanceStatus = getOrCreateAdminClient().getRebalanceClient()
+            .getRebalanceStatusObject(rebalanceJobId);
+        return rebalanceStatus.getTableRebalanceProgressStats().getStatus() == RebalanceResult.Status.DONE;
+      } catch (PinotAdminNotFoundException e) {
+        // Job may not be registered in ZK yet; keep polling
+        return null;
+      } catch (Exception e) {
+        Assert.fail("Caught exception while waiting for rebalance to complete", e);
+        return null;
+      }
+    }, 1000L, timeoutMs, "Failed to complete rebalance");
+  }
+
+  protected void waitForTableEVISConverge(String tableName, long timeoutMs) {
+    TestUtils.waitForCondition(aVoid -> {
+      try {
+        TableView idealState =
+            getOrCreateAdminClient().getTableClient().getIdealStateObject(tableName);
+        TableView externalView =
+            getOrCreateAdminClient().getTableClient().getExternalViewObject(tableName);
+        return Objects.equals(idealState._realtime, externalView._realtime)
+            && Objects.equals(idealState._offline, externalView._offline);
+      } catch (Exception e) {
+        Assert.fail("Caught exception while waiting for table EV and IS to converge", e);
+        return null;
+      }
+    }, 1000L, timeoutMs, "Failed to converge EV and IS for table: " + tableName);
+  }
+
+  /// Helper method to perform segment moving test regarding forceCommit in rebalance with specified configuration.
+  /// Changes the table tenant, executes rebalance with force commit, and verifies if segments were committed.
+  protected void performForceCommitSegmentMovingTest(RebalanceConfig rebalanceConfig, TableConfig tableConfig,
+      String newTenant,
+      boolean shouldCommit, long timeoutMs)
+      throws Exception {
+    performForceCommitSegmentMovingTest(rebalanceConfig, tableConfig, newTenant, shouldCommit, timeoutMs, false);
+  }
+
+  /// Helper method to perform segment moving test regarding forceCommit in rebalance with EVIS convergence wait.
+  /// Similar to performSegmentMovingTest but waits for external view/ideal state convergence instead of rebalance
+  /// completion.
+  protected void performForceCommitSegmentMovingTestWithEVISConverge(RebalanceConfig rebalanceConfig,
+      TableConfig tableConfig,
+      String newTenant, boolean shouldCommit, long timeoutMs)
+      throws Exception {
+    performForceCommitSegmentMovingTest(rebalanceConfig, tableConfig, newTenant, shouldCommit, timeoutMs, true);
+  }
+
+  /// Helper method to perform segment moving test regarding forceCommit in rebalance with specified configuration.
+  /// Changes the table tenant, executes rebalance with force commit, and verifies if segments were committed.
+  ///
+  /// @param rebalanceConfig the rebalance configuration
+  /// @param tableConfig the table configuration
+  /// @param newTenant the new tenant to move segments to
+  /// @param shouldCommit whether segments should be committed (affects verification)
+  /// @param timeoutMs timeout in milliseconds
+  /// @param waitForEVISConverge if true, waits for external view/ideal state convergence; if false, waits for
+  ///                            rebalance completion
+  private void performForceCommitSegmentMovingTest(RebalanceConfig rebalanceConfig, TableConfig tableConfig,
+      String newTenant,
+      boolean shouldCommit, long timeoutMs, boolean waitForEVISConverge)
+      throws Exception {
+    // Change tenant
+    tableConfig.setTenantConfig(new TenantConfig(getBrokerTenant(), newTenant, null));
+    updateTableConfig(tableConfig);
+
+    // Set force commit
+    rebalanceConfig.setForceCommit(true);
+
+    // Execute rebalance
+    RebalanceResult rebalanceResult = triggerTableRebalance(rebalanceConfig, TableType.REALTIME);
+
+    // Get original consuming segments (if present)
+    Set<String> originalConsumingSegmentsToMove = null;
+    if (rebalanceResult.getRebalanceSummaryResult() != null
+        && rebalanceResult.getRebalanceSummaryResult().getSegmentInfo() != null
+        && rebalanceResult.getRebalanceSummaryResult().getSegmentInfo().getConsumingSegmentToBeMovedSummary() != null) {
+      originalConsumingSegmentsToMove = rebalanceResult.getRebalanceSummaryResult().getSegmentInfo()
+          .getConsumingSegmentToBeMovedSummary()
+          .getConsumingSegmentsToBeMovedWithMostOffsetsToCatchUp()
+          .keySet();
+    }
+
+    // Wait for completion based on the flag
+    if (waitForEVISConverge) {
+      waitForTableEVISConverge(getTableName(), timeoutMs);
+    } else {
+      waitForRebalanceToComplete(rebalanceResult.getJobId(), timeoutMs);
+    }
+
+    // Check if segments were committed (only if there were consuming segments to move)
+    if (originalConsumingSegmentsToMove != null && !originalConsumingSegmentsToMove.isEmpty()) {
+      ConsumingSegmentInfoReader.ConsumingSegmentsInfoMap consumingSegmentInfoResponse =
+          getOrCreateAdminClient().getTableClient().getConsumingSegmentsInfo(getTableName(),
+              ConsumingSegmentInfoReader.ConsumingSegmentsInfoMap.class);
+      LLCSegmentName consumingSegmentNow = new LLCSegmentName(
+          consumingSegmentInfoResponse._segmentToConsumingInfoMap.keySet().stream().sorted().iterator().next());
+      LLCSegmentName consumingSegmentOriginal =
+          new LLCSegmentName(originalConsumingSegmentsToMove.stream().sorted().iterator().next());
+
+      if (shouldCommit) {
+        assertEquals(consumingSegmentNow.getSequenceNumber(), consumingSegmentOriginal.getSequenceNumber() + 1);
+      } else {
+        assertEquals(consumingSegmentNow.getSequenceNumber(), consumingSegmentOriginal.getSequenceNumber());
+      }
+    }
+  }
+}

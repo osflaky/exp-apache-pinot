@@ -1,0 +1,133 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pinot.core.operator.streaming;
+
+import java.util.List;
+import org.apache.pinot.common.datatable.DataTable.MetadataKey;
+import org.apache.pinot.common.utils.config.QueryOptionsUtils;
+import org.apache.pinot.core.operator.InstanceResponseOperator;
+import org.apache.pinot.core.operator.blocks.InstanceResponseBlock;
+import org.apache.pinot.core.operator.blocks.results.BaseResultsBlock;
+import org.apache.pinot.core.operator.blocks.results.ExceptionResultsBlock;
+import org.apache.pinot.core.operator.blocks.results.MetadataResultsBlock;
+import org.apache.pinot.core.operator.combine.BaseCombineOperator;
+import org.apache.pinot.core.query.executor.ResultsBlockStreamer;
+import org.apache.pinot.core.query.request.context.QueryContext;
+import org.apache.pinot.segment.spi.FetchContext;
+import org.apache.pinot.segment.spi.SegmentContext;
+import org.apache.pinot.spi.exception.QueryErrorCode;
+import org.apache.pinot.spi.exception.QueryErrorMessage;
+import org.apache.pinot.spi.exception.QueryException;
+import org.apache.pinot.spi.query.QueryThreadContext;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+
+/// Like [InstanceResponseOperator], but instead of sending all the data to the broker at once, it streams the
+/// data to a given [ResultsBlockStreamer].
+///
+/// This is used in multi-stage to stream data to the receiving mailboxes.
+public class StreamingInstanceResponseOperator extends InstanceResponseOperator {
+  private static final String EXPLAIN_NAME = "STREAMING_INSTANCE_RESPONSE";
+  private static final Logger LOGGER = LoggerFactory.getLogger(StreamingInstanceResponseOperator.class);
+
+  private final BaseStreamingCombineOperator<?> _streamingCombineOperator;
+  private final ResultsBlockStreamer _streamer;
+
+  public StreamingInstanceResponseOperator(BaseCombineOperator<?> combinedOperator,
+      List<SegmentContext> segmentContexts, List<FetchContext> fetchContexts, ResultsBlockStreamer streamer,
+      QueryContext queryContext) {
+    super(combinedOperator, segmentContexts, fetchContexts, queryContext);
+    _streamingCombineOperator =
+        combinedOperator instanceof BaseStreamingCombineOperator ? (BaseStreamingCombineOperator<?>) combinedOperator
+            : null;
+    _streamer = streamer;
+  }
+
+  @Override
+  protected InstanceResponseBlock getNextBlock() {
+    try {
+      prefetchAll();
+      if (_streamingCombineOperator != null) {
+        _streamingCombineOperator.start();
+        long totalRowsStreamed = 0;
+        BaseResultsBlock resultsBlock = getBaseBlock();
+        while (!(resultsBlock instanceof MetadataResultsBlock)) {
+          if (resultsBlock instanceof ExceptionResultsBlock) {
+            return new InstanceResponseBlock(resultsBlock);
+          }
+          if (resultsBlock.getNumRows() > 0) {
+            totalRowsStreamed += resultsBlock.getNumRows();
+            _streamer.send(resultsBlock);
+          }
+          resultsBlock = getBaseBlock();
+        }
+        // Return a metadata-only block in the end
+        InstanceResponseBlock responseBlock = buildInstanceResponseBlock(resultsBlock);
+        addLiteModeMetadataIfNeeded(responseBlock, totalRowsStreamed);
+        return responseBlock;
+      } else {
+        // Handle single block combine operator in streaming fashion
+        BaseResultsBlock resultsBlock = getBaseBlock();
+        if (resultsBlock instanceof ExceptionResultsBlock) {
+          return new InstanceResponseBlock(resultsBlock);
+        }
+        if (resultsBlock.getNumRows() > 0) {
+          _streamer.send(resultsBlock);
+        }
+        return buildInstanceResponseBlock(resultsBlock).toMetadataOnlyResponseBlock();
+      }
+    } catch (Throwable t) {
+      // First check terminate exception and use it as the results block if exists. We want to return the termination
+      // reason when query is explicitly terminated.
+      QueryException queryException = QueryThreadContext.getTerminateException();
+      if (queryException == null && t instanceof QueryException) {
+        queryException = (QueryException) t;
+      }
+      if (queryException != null) {
+        return new InstanceResponseBlock(new ExceptionResultsBlock(queryException));
+      } else {
+        LOGGER.error("Caught exception while streaming results (query: {})", _queryContext, t);
+        return new InstanceResponseBlock(new ExceptionResultsBlock(QueryErrorMessage.safeMsg(QueryErrorCode.INTERNAL,
+            "Caught unhandled exception while streaming results: " + t.getMessage())));
+      }
+    } finally {
+      if (_streamingCombineOperator != null) {
+        _streamingCombineOperator.stop();
+      }
+      releaseAll();
+    }
+  }
+
+  protected BaseResultsBlock getCombinedResults() {
+    return _combineOperator.nextBlock();
+  }
+
+  private void addLiteModeMetadataIfNeeded(InstanceResponseBlock responseBlock, long totalRowsStreamed) {
+    Integer implicitLimit = QueryOptionsUtils.getLiteModeImplicitLeafStageLimit(_queryContext.getQueryOptions());
+    if (implicitLimit != null && totalRowsStreamed >= implicitLimit) {
+      responseBlock.addMetadata(MetadataKey.LITE_MODE_LEAF_STAGE_LIMIT_REACHED.getName(), "true");
+    }
+  }
+
+  @Override
+  public String toExplainString() {
+    return EXPLAIN_NAME;
+  }
+}

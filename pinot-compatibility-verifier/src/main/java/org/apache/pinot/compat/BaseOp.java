@@ -1,0 +1,105 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pinot.compat;
+
+import com.fasterxml.jackson.annotation.JsonSubTypes;
+import com.fasterxml.jackson.annotation.JsonTypeInfo;
+import java.net.URI;
+import java.util.Properties;
+import org.apache.pinot.client.PinotClientException;
+import org.apache.pinot.client.admin.PinotAdminClient;
+import org.apache.pinot.client.admin.PinotAdminTransport;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+
+@JsonTypeInfo(use = JsonTypeInfo.Id.NAME, property = "type")
+@JsonSubTypes({
+    @JsonSubTypes.Type(value = SegmentOp.class, name = "segmentOp"),
+    @JsonSubTypes.Type(value = TableOp.class, name = "tableOp"),
+    @JsonSubTypes.Type(value = QueryOp.class, name = "queryOp"),
+    @JsonSubTypes.Type(value = StreamOp.class, name = "streamOp")
+})
+public abstract class BaseOp {
+  enum OpType {
+    TABLE_OP, SEGMENT_OP, QUERY_OP, STREAM_OP,
+  }
+
+  private String _name;
+  private final OpType _opType;
+  private String _description = "No description provided";
+  private static final Logger LOGGER = LoggerFactory.getLogger(BaseOp.class);
+  protected static final String GENERATION_NUMBER_PLACEHOLDER = "__GENERATION_NUMBER__";
+  protected static final String CONFIG_PLACEHOLDER = "/config/";
+  private String _parentDir;
+
+  protected BaseOp(OpType opType) {
+    _opType = opType;
+  }
+
+  public String getName() {
+    return _name;
+  }
+
+  public void setName(String name) {
+    _name = name;
+  }
+
+  public void setDescription(String description) {
+    _description = description;
+  }
+
+  public String getDescription() {
+    return _description;
+  }
+
+  public String getParentDir() {
+    return _parentDir;
+  }
+
+  public void setParentDir(String parentDir) {
+    _parentDir = parentDir;
+  }
+
+  public String getAbsoluteFileName(String fileName) {
+    return _parentDir + CONFIG_PLACEHOLDER + fileName;
+  }
+
+  public boolean run(int generationNumber) {
+    LOGGER.info("Running OpType {} : {}", _opType.toString(), getDescription());
+    return runOp(generationNumber);
+  }
+
+  abstract boolean runOp(int generationNumber);
+
+  protected PinotAdminClient createPinotAdminClient()
+      throws PinotClientException {
+    URI controllerUri = URI.create(ClusterDescriptor.getInstance().getControllerUrl());
+    Properties properties = new Properties();
+    if (controllerUri.getScheme() != null) {
+      properties.setProperty(PinotAdminTransport.ADMIN_TRANSPORT_SCHEME, controllerUri.getScheme());
+    }
+    String host = controllerUri.getHost();
+    int port = controllerUri.getPort();
+    if (host == null || port == -1) {
+      throw new PinotClientException("Invalid controller URI: " + controllerUri);
+    }
+    return new PinotAdminClient(host + ":" + port, properties);
+  }
+}

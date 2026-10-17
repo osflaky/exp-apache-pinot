@@ -1,0 +1,544 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pinot.controller.util;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.google.common.base.Preconditions;
+import com.google.common.collect.BiMap;
+import com.google.common.collect.Lists;
+import java.io.IOException;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+import javax.annotation.Nullable;
+import javax.ws.rs.client.ClientBuilder;
+import javax.ws.rs.client.Invocation;
+import javax.ws.rs.core.MediaType;
+import org.apache.commons.lang3.tuple.Pair;
+import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManager;
+import org.apache.hc.client5.http.io.HttpClientConnectionManager;
+import org.apache.pinot.common.auth.AuthProviderUtils;
+import org.apache.pinot.common.restlet.resources.ServerTableMetadataInfo;
+import org.apache.pinot.common.restlet.resources.TableMetadataInfo;
+import org.apache.pinot.common.restlet.resources.TableSegments;
+import org.apache.pinot.common.restlet.resources.ValidDocIdsBitmapResponse;
+import org.apache.pinot.common.restlet.resources.ValidDocIdsMetadataInfo;
+import org.apache.pinot.controller.api.resources.TableStaleSegmentResponse;
+import org.apache.pinot.segment.local.data.manager.StaleSegment;
+import org.apache.pinot.spi.auth.AuthProvider;
+import org.apache.pinot.spi.utils.JsonUtils;
+import org.apache.pinot.spi.utils.builder.UrlBuilderUtils;
+import org.glassfish.jersey.client.ClientConfig;
+import org.glassfish.jersey.client.ClientProperties;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+
+/// This is a helper class that calls the server API endpoints to fetch server metadata and the segment reload status
+/// Only the servers returning success are returned by the method. For servers returning errors (http error or
+/// otherwise),
+/// no entry is created in the return list
+public class ServerSegmentMetadataReader {
+  private static final Logger LOGGER = LoggerFactory.getLogger(ServerSegmentMetadataReader.class);
+  private static final String COLUMNS_KEY = "columns";
+  private static final String SEGMENTS_KEY = "segments";
+
+  private final Executor _executor;
+  private final HttpClientConnectionManager _connectionManager;
+  @Nullable
+  private final AuthProvider _authProvider;
+
+  public ServerSegmentMetadataReader() {
+    this(Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors()),
+        new PoolingHttpClientConnectionManager(), null);
+  }
+
+  public ServerSegmentMetadataReader(Executor executor, HttpClientConnectionManager connectionManager) {
+    this(executor, connectionManager, null);
+  }
+
+  public ServerSegmentMetadataReader(Executor executor, HttpClientConnectionManager connectionManager,
+      @Nullable AuthProvider authProvider) {
+    _executor = executor;
+    _connectionManager = connectionManager;
+    _authProvider = authProvider;
+  }
+
+  /// This method is called when the API request is to fetch aggregated segment metadata for all segments of the table.
+  /// This method makes a MultiGet call to all servers that host their respective segments and gets the results.
+  /// This method accept a list of column names as filter, and will return column metadata for the column in the
+  /// list.
+  /// TODO Some performance improvement ideas to explore:
+  /// - If table has replica groups, only send requests to one replica group.
+  /// - If table does not have replica groups, send requests to a minimal set of servers hosting all segments of the
+  ///   table.
+  /// Reads aggregate metadata without compression statistics.
+  public TableMetadataInfo getAggregatedTableMetadataFromServer(String tableNameWithType,
+      BiMap<String, String> serverEndPoints, @Nullable List<String> columns, int numReplica, int timeoutMs) {
+    return getAggregatedTableMetadataFromServer(tableNameWithType, serverEndPoints, columns, numReplica, timeoutMs,
+        false, false, Map.of());
+  }
+
+  public TableMetadataInfo getAggregatedTableMetadataFromServer(String tableNameWithType,
+      BiMap<String, String> serverEndPoints, @Nullable List<String> columns, int numReplica, int timeoutMs,
+      boolean compressionStatsEnabled, boolean includeColumnCompressionStats,
+      Map<String, List<String>> serverToSegmentsMap) {
+    int numServers = serverEndPoints.size();
+    LOGGER.info("Reading aggregated segment metadata from {} servers for table: {} with timeout: {}ms", numServers,
+        tableNameWithType, timeoutMs);
+    long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+
+    List<String> serverUrls = new ArrayList<>(numServers);
+    BiMap<String, String> endpointsToServers = serverEndPoints.inverse();
+    for (String endpoint : endpointsToServers.keySet()) {
+      String serverUrl = generateAggregateSegmentMetadataServerURL(tableNameWithType, columns, endpoint, false);
+      serverUrls.add(serverUrl);
+    }
+
+    // Helper service to run a http get call to the server
+    CompletionServiceHelper completionServiceHelper =
+        new CompletionServiceHelper(_executor, _connectionManager, endpointsToServers, _authProvider);
+    CompletionServiceHelper.CompletionServiceResponse serviceResponse = compressionStatsEnabled
+        ? completionServiceHelper.doMultiGetRequestUntil(serverUrls, tableNameWithType, false, timeoutMs, deadlineNanos,
+            "aggregate segment metadata")
+        : completionServiceHelper.doMultiGetRequest(serverUrls, tableNameWithType, false, timeoutMs,
+            "aggregate segment metadata");
+
+    long totalDiskSizeInBytes = 0;
+    int totalNumSegments = 0;
+    long totalNumRows = 0;
+    int failedParses = 0;
+    Map<String, Double> columnLengthMap = new HashMap<>();
+    Map<String, Double> columnCardinalityMap = new HashMap<>();
+    Map<String, Double> maxNumMultiValuesMap = new HashMap<>();
+    Map<String, Map<String, Double>> columnIndexSizeMap = new HashMap<>();
+    Map<Integer, Map<String, Long>> partitionToServerPrimaryKeyCountMap = new HashMap<>();
+    for (Map.Entry<String, String> streamResponse : serviceResponse._httpResponses.entrySet()) {
+      try {
+        ServerTableMetadataInfo tableMetadataInfo =
+            JsonUtils.stringToObject(streamResponse.getValue(), ServerTableMetadataInfo.class);
+        totalDiskSizeInBytes += tableMetadataInfo.getDiskSizeInBytes();
+        totalNumRows += tableMetadataInfo.getNumRows();
+        totalNumSegments += tableMetadataInfo.getNumSegments();
+        tableMetadataInfo.getColumnLengthMap().forEach((k, v) -> columnLengthMap.merge(k, v, Double::sum));
+        tableMetadataInfo.getColumnCardinalityMap().forEach((k, v) -> columnCardinalityMap.merge(k, v, Double::sum));
+        tableMetadataInfo.getMaxNumMultiValuesMap().forEach((k, v) -> maxNumMultiValuesMap.merge(k, v, Double::sum));
+        tableMetadataInfo.getColumnIndexSizeMap().forEach((column, indexSizes) -> {
+          Map<String, Double> aggregateIndexSizes = columnIndexSizeMap.get(column);
+          if (aggregateIndexSizes == null) {
+            columnIndexSizeMap.put(column, new HashMap<>(indexSizes));
+          } else {
+            indexSizes.forEach((index, size) -> aggregateIndexSizes.merge(index, size, Double::sum));
+          }
+        });
+        tableMetadataInfo.getPartitionToServerPrimaryKeyCountMap().forEach(
+            (partition, serverToPrimaryKeyCount) -> partitionToServerPrimaryKeyCountMap.merge(partition,
+                new HashMap<>(serverToPrimaryKeyCount), (l, r) -> {
+                  for (Map.Entry<String, Long> serverToPKCount : r.entrySet()) {
+                    l.merge(serverToPKCount.getKey(), serverToPKCount.getValue(), Long::sum);
+                  }
+                  return l;
+                }));
+      } catch (IOException e) {
+        failedParses++;
+        LOGGER.error("Unable to parse server {} response due to an error: ", streamResponse.getKey(), e);
+      }
+    }
+    int finalTotalNumSegments = totalNumSegments;
+    columnLengthMap.replaceAll((k, v) -> v / finalTotalNumSegments);
+    columnCardinalityMap.replaceAll((k, v) -> v / finalTotalNumSegments);
+    maxNumMultiValuesMap.replaceAll((k, v) -> v / finalTotalNumSegments);
+    columnIndexSizeMap.replaceAll((k, v) -> {
+      v.replaceAll((key, value) -> v.get(key) / finalTotalNumSegments);
+      return v;
+    });
+
+    // Since table segments may have multiple replicas, divide diskSizeInBytes, numRows and numSegments by numReplica
+    // to avoid double counting, for columnAvgLengthMap, columnAvgCardinalityMap and maxNumMultiValuesMap, dividing by
+    // numReplica is not needed since totalNumSegments already contains replicas.
+    totalDiskSizeInBytes /= numReplica;
+    totalNumSegments /= numReplica;
+    totalNumRows /= numReplica;
+
+    ServerCompressionStatsReader.CompressionStatsResult compressionStats = compressionStatsEnabled
+        ? new ServerCompressionStatsReader(_executor, _connectionManager, _authProvider).read(tableNameWithType,
+            serverToSegmentsMap, serverEndPoints, columns, includeColumnCompressionStats, deadlineNanos) : null;
+
+    TableMetadataInfo aggregateTableMetadataInfo =
+        new TableMetadataInfo(tableNameWithType, totalDiskSizeInBytes, totalNumSegments, totalNumRows, columnLengthMap,
+            columnCardinalityMap, maxNumMultiValuesMap, columnIndexSizeMap, partitionToServerPrimaryKeyCountMap,
+            compressionStats != null ? compressionStats.getColumnStats() : null,
+            compressionStats != null ? compressionStats.getSummary() : null);
+    if (failedParses != 0) {
+      LOGGER.warn("Failed to parse {} / {} aggregated segment metadata responses from servers.", failedParses,
+          serverUrls.size());
+    }
+    return aggregateTableMetadataInfo;
+  }
+
+  /// This method is called when the API request is to fetch segment metadata for all segments of the table.
+  /// This method makes a MultiGet call to all servers that host their respective segments and gets the results.
+  /// This method accept a list of column names as filter, and will return column metadata for the column in the
+  /// list.
+  /// @return list of segments and their metadata as a JSON string
+  public List<String> getSegmentMetadataFromServer(String tableNameWithType,
+      Map<String, List<String>> serversToSegmentsMap, BiMap<String, String> endpoints, List<String> columns,
+      int timeoutMs) {
+    LOGGER.debug("Reading segment metadata from servers for table {}.", tableNameWithType);
+    List<String> serverURLs = new ArrayList<>();
+    for (Map.Entry<String, List<String>> serverToSegments : serversToSegmentsMap.entrySet()) {
+      List<String> segments = serverToSegments.getValue();
+      for (String segment : segments) {
+        serverURLs.add(generateSegmentMetadataServerURL(tableNameWithType, segment, columns,
+            endpoints.get(serverToSegments.getKey())));
+      }
+    }
+    BiMap<String, String> endpointsToServers = endpoints.inverse();
+    CompletionServiceHelper completionServiceHelper =
+        new CompletionServiceHelper(_executor, _connectionManager, endpointsToServers, _authProvider);
+    CompletionServiceHelper.CompletionServiceResponse serviceResponse =
+        completionServiceHelper.doMultiGetRequest(serverURLs, tableNameWithType, true, timeoutMs);
+    List<String> segmentsMetadata = new ArrayList<>();
+
+    int failedParses = 0;
+    for (Map.Entry<String, String> streamResponse : serviceResponse._httpResponses.entrySet()) {
+      try {
+        String segmentMetadata = streamResponse.getValue();
+        segmentsMetadata.add(segmentMetadata);
+      } catch (Exception e) {
+        failedParses++;
+        LOGGER.error("Unable to parse server {} response due to an error: ", streamResponse.getKey(), e);
+      }
+    }
+    if (failedParses != 0) {
+      LOGGER.error("Unable to parse server {} / {} response due to an error: ", failedParses, serverURLs.size());
+    }
+
+    LOGGER.debug("Retrieved segment metadata from servers.");
+    return segmentsMetadata;
+  }
+
+  /// This method is called when the API request is to fetch data about segment reload of the table.
+  /// This method makes a MultiGet call to all servers that host their respective segments and gets the results.
+  /// This method will return metadata of all the servers along with need reload flag.
+  /// In future additional details like segments list can also be added
+  public TableReloadResponse getCheckReloadSegmentsFromServer(String tableNameWithType,
+      Set<String> serverInstances, BiMap<String, String> endpoints, int timeoutMs) {
+    LOGGER.debug("Checking if reload is needed on segments from servers for table {}.", tableNameWithType);
+    List<String> serverURLs = new ArrayList<>();
+    for (String serverInstance : serverInstances) {
+      serverURLs.add(generateCheckReloadSegmentsServerURL(tableNameWithType, endpoints.get(serverInstance)));
+    }
+    BiMap<String, String> endpointsToServers = endpoints.inverse();
+    CompletionServiceHelper completionServiceHelper =
+        new CompletionServiceHelper(_executor, _connectionManager, endpointsToServers, _authProvider);
+    CompletionServiceHelper.CompletionServiceResponse serviceResponse =
+        completionServiceHelper.doMultiGetRequest(serverURLs, tableNameWithType, true, timeoutMs);
+    List<String> serversNeedReloadResponses = new ArrayList<>();
+
+    int failedParses = 0;
+    for (Map.Entry<String, String> streamResponse : serviceResponse._httpResponses.entrySet()) {
+      try {
+        serversNeedReloadResponses.add(streamResponse.getValue());
+      } catch (Exception e) {
+        failedParses++;
+        LOGGER.error("Unable to parse server {} response due to an error: ", streamResponse.getKey(), e);
+      }
+    }
+    if (failedParses != 0) {
+      LOGGER.error("Unable to parse server {} / {} response due to an error: ", failedParses, serverURLs.size());
+    }
+
+    LOGGER.debug("Retrieved metadata of reload check from servers.");
+    return new TableReloadResponse(serviceResponse._failedResponseCount, serversNeedReloadResponses);
+  }
+
+  /// This method is called when the API request is to fetch validDocId metadata for a list segments of the given table.
+  /// This method will pick one server randomly that hosts the target segment and fetch the segment metadata result.
+  ///
+  /// @return list of valid doc id metadata, one per segment processed.
+  public List<ValidDocIdsMetadataInfo> getValidDocIdsMetadataFromServer(String tableNameWithType,
+      Map<String, List<String>> serverToSegmentsMap, BiMap<String, String> serverToEndpoints,
+      @Nullable List<String> segmentNames, int timeoutMs, String validDocIdsType,
+      int numSegmentsBatchPerServerRequest) {
+    return getSegmentToValidDocIdsMetadataFromServer(tableNameWithType, serverToSegmentsMap, serverToEndpoints,
+        segmentNames, timeoutMs, validDocIdsType, numSegmentsBatchPerServerRequest).getSegmentToMetadata().values()
+        .stream().filter(list -> list != null && !list.isEmpty()).map(list -> list.get(0))
+        .collect(Collectors.toList());
+  }
+
+  /// This method is called when the API request is to fetch validDocId metadata for a list segments of the given table.
+  /// This method will pick all servers that hosts the target segment and fetch the segment metadata result and
+  /// return as a list.
+  ///
+  /// @return the per-segment metadata from every responding server, plus the expected replica count per segment.
+  public ValidDocIdsMetadataResult getSegmentToValidDocIdsMetadataFromServer(String tableNameWithType,
+      Map<String, List<String>> serverToSegmentsMap, BiMap<String, String> serverToEndpoints,
+      @Nullable List<String> segmentNames, int timeoutMs, String validDocIdsType,
+      int numSegmentsBatchPerServerRequest) {
+    List<Pair<String, String>> serverURLsAndBodies = new ArrayList<>();
+    Map<String, Integer> segmentToExpectedReplicaCount = new HashMap<>();
+    for (Map.Entry<String, List<String>> serverToSegments : serverToSegmentsMap.entrySet()) {
+      List<String> segmentsForServer = serverToSegments.getValue();
+      List<String> segmentsToQuery = new ArrayList<>();
+      if (segmentNames == null || segmentNames.isEmpty()) {
+        segmentsToQuery.addAll(segmentsForServer);
+      } else {
+        Set<String> segmentNamesLookUpTable = new HashSet<>(segmentNames);
+        for (String segment : segmentsForServer) {
+          if (segmentNamesLookUpTable.contains(segment)) {
+            segmentsToQuery.add(segment);
+          }
+        }
+      }
+      for (String segment : segmentsToQuery) {
+        segmentToExpectedReplicaCount.merge(segment, 1, Integer::sum);
+      }
+
+      // Number of segments to query per server request. If a table has a lot of segments, then we might send a
+      // huge payload to pinot-server in request. Batching the requests will help in reducing the payload size.
+      Lists.partition(segmentsToQuery, numSegmentsBatchPerServerRequest).forEach(segmentsToQueryBatch ->
+          serverURLsAndBodies.add(generateValidDocIdsMetadataURL(tableNameWithType, segmentsToQueryBatch,
+              validDocIdsType, serverToEndpoints.get(serverToSegments.getKey()))));
+    }
+
+    BiMap<String, String> endpointsToServers = serverToEndpoints.inverse();
+
+    // request the urls from the servers
+    CompletionServiceHelper completionServiceHelper =
+        new CompletionServiceHelper(_executor, _connectionManager, endpointsToServers, _authProvider);
+
+    Map<String, String> requestHeaders = Map.of("Content-Type", "application/json");
+    CompletionServiceHelper.CompletionServiceResponse serviceResponse =
+        completionServiceHelper.doMultiPostRequest(serverURLsAndBodies, tableNameWithType, true, requestHeaders,
+            timeoutMs, null);
+
+    Map<String, List<ValidDocIdsMetadataInfo>> validDocIdsMetadataInfos = new HashMap<>();
+    int failedParses = 0;
+    int returnedServerRequestsCount = 0;
+    for (Map.Entry<String, String> streamResponse : serviceResponse._httpResponses.entrySet()) {
+      try {
+        String validDocIdsMetadataList = streamResponse.getValue();
+        List<ValidDocIdsMetadataInfo> validDocIdsMetadataInfoList =
+            JsonUtils.stringToObject(validDocIdsMetadataList, new TypeReference<ArrayList<ValidDocIdsMetadataInfo>>() {
+            });
+        for (ValidDocIdsMetadataInfo validDocIdsMetadataInfo : validDocIdsMetadataInfoList) {
+          validDocIdsMetadataInfos.computeIfAbsent(validDocIdsMetadataInfo.getSegmentName(), k -> new ArrayList<>())
+              .add(validDocIdsMetadataInfo);
+        }
+        returnedServerRequestsCount++;
+      } catch (Exception e) {
+        failedParses++;
+        LOGGER.error("Unable to parse {} server-request response due to an error: ", streamResponse.getKey(), e);
+      }
+    }
+
+    if (failedParses != 0) {
+      LOGGER.error("Unable to parse {} / {} server-request responses due to an error: ", failedParses,
+          serverURLsAndBodies.size());
+    }
+
+    if (returnedServerRequestsCount != serverURLsAndBodies.size()) {
+      LOGGER.error("Unable to get validDocIdsMetadata from all server requests. Expected: {}, Actual: {}",
+          serverURLsAndBodies.size(), returnedServerRequestsCount);
+    }
+
+    if (segmentNames != null && !segmentNames.isEmpty() && segmentNames.size() != validDocIdsMetadataInfos.size()) {
+      LOGGER.error("Unable to get validDocIdsMetadata for all segments. Expected: {}, Actual: {}", segmentNames.size(),
+          validDocIdsMetadataInfos.size());
+    }
+
+    LOGGER.info("Retrieved validDocIds metadata for {} segments from {} server requests.",
+        validDocIdsMetadataInfos.size(), returnedServerRequestsCount);
+    return new ValidDocIdsMetadataResult(validDocIdsMetadataInfos, segmentToExpectedReplicaCount);
+  }
+
+  /// Result of \[#getSegmentToValidDocIdsMetadataFromServer\]: the per-segment metadata from every responding server,
+  /// plus the expected replica count per segment (how many servers host it). The count lets callers detect a replica
+  /// that did not respond, since a missing replica is simply absent from the metadata.
+  public static class ValidDocIdsMetadataResult {
+    private final Map<String, List<ValidDocIdsMetadataInfo>> _segmentToMetadata;
+    private final Map<String, Integer> _segmentToExpectedReplicaCount;
+
+    public ValidDocIdsMetadataResult(Map<String, List<ValidDocIdsMetadataInfo>> segmentToMetadata,
+        Map<String, Integer> segmentToExpectedReplicaCount) {
+      _segmentToMetadata = segmentToMetadata;
+      _segmentToExpectedReplicaCount = segmentToExpectedReplicaCount;
+    }
+
+    public Map<String, List<ValidDocIdsMetadataInfo>> getSegmentToMetadata() {
+      return _segmentToMetadata;
+    }
+
+    public Map<String, Integer> getSegmentToExpectedReplicaCount() {
+      return _segmentToExpectedReplicaCount;
+    }
+  }
+
+  /// This method is called when the API request is to fetch validDocIds for a segment of the given table. This method
+  /// will pick a server that hosts the target segment and fetch the validDocIds result.
+  ///
+  /// @return a bitmap of validDocIds
+  public ValidDocIdsBitmapResponse getValidDocIdsBitmapFromServer(String tableNameWithType, String segmentName,
+      String endpoint, String validDocIdsType, int timeoutMs) {
+    // Build the endpoint url
+    String url = generateValidDocIdsBitmapURL(tableNameWithType, segmentName, validDocIdsType, endpoint);
+
+    // Set timeout
+    ClientConfig clientConfig = new ClientConfig();
+    clientConfig.property(ClientProperties.CONNECT_TIMEOUT, timeoutMs);
+    clientConfig.property(ClientProperties.READ_TIMEOUT, timeoutMs);
+
+    Invocation.Builder request = ClientBuilder.newClient(clientConfig).target(url).request(MediaType.APPLICATION_JSON);
+    AuthProviderUtils.makeAuthHeadersMap(_authProvider).forEach(request::header);
+    ValidDocIdsBitmapResponse response = request.get(ValidDocIdsBitmapResponse.class);
+    Preconditions.checkNotNull(response, "Unable to retrieve validDocIdsBitmap from %s", url);
+    return response;
+  }
+
+  public Map<String, TableStaleSegmentResponse> getStaleSegmentsFromServer(
+      String tableNameWithType, Set<String> serverInstances, BiMap<String, String> endpoints, int timeoutMs) {
+    LOGGER.debug("Getting list of segments for refresh from servers for table {}.", tableNameWithType);
+    List<String> serverURLs = new ArrayList<>();
+    for (String serverInstance : serverInstances) {
+      serverURLs.add(generateStaleSegmentsServerURL(tableNameWithType, endpoints.get(serverInstance)));
+    }
+    BiMap<String, String> endpointsToServers = endpoints.inverse();
+    CompletionServiceHelper completionServiceHelper =
+        new CompletionServiceHelper(_executor, _connectionManager, endpointsToServers, _authProvider);
+    CompletionServiceHelper.CompletionServiceResponse serviceResponse =
+        completionServiceHelper.doMultiGetRequest(serverURLs, tableNameWithType, false, timeoutMs);
+    Map<String, TableStaleSegmentResponse> serverResponses = new HashMap<>();
+
+    for (Map.Entry<String, String> streamResponse : serviceResponse._httpResponses.entrySet()) {
+      try {
+        List<StaleSegment> staleSegments = JsonUtils.stringToObject(streamResponse.getValue(),
+            new TypeReference<List<StaleSegment>>() { });
+        serverResponses.put(streamResponse.getKey(), new TableStaleSegmentResponse(staleSegments));
+      } catch (Exception e) {
+        serverResponses.put(streamResponse.getKey(), new TableStaleSegmentResponse(e.getMessage()));
+        LOGGER.error("Unable to parse server {} response for needRefresh for table {} due to an error: ",
+            streamResponse.getKey(), tableNameWithType, e);
+      }
+    }
+    return serverResponses;
+  }
+
+  private String generateAggregateSegmentMetadataServerURL(String tableNameWithType, @Nullable List<String> columns,
+      String endpoint, boolean includeColumnCompressionStats) {
+    tableNameWithType = encode(tableNameWithType);
+    String columnsParam = UrlBuilderUtils.generateColumnsParam(columns);
+    String url = String.format("%s/tables/%s/metadata", endpoint, tableNameWithType);
+    StringBuilder sb = new StringBuilder(url);
+    if (columnsParam != null) {
+      sb.append("?").append(columnsParam);
+      if (includeColumnCompressionStats) {
+        sb.append("&includeColumnCompressionStats=true");
+      }
+    } else if (includeColumnCompressionStats) {
+      sb.append("?includeColumnCompressionStats=true");
+    }
+    return sb.toString();
+  }
+
+  public String generateSegmentMetadataServerURL(String tableNameWithType, String segmentName,
+      @Nullable List<String> columns, String endpoint) {
+    tableNameWithType = encode(tableNameWithType);
+    segmentName = UrlBuilderUtils.encode(segmentName);
+    String columnsParam = UrlBuilderUtils.generateColumnsParam(columns);
+    String url = String.format("%s/tables/%s/segments/%s/metadata", endpoint, tableNameWithType, segmentName);
+    return columnsParam != null ? url + "?" + columnsParam : url;
+  }
+
+  public String generateTableMetadataServerURL(String tableNameWithType, @Nullable List<String> columns,
+      @Nullable List<String> segments, String endpoint) {
+    tableNameWithType = encode(tableNameWithType);
+    String columnsAndSegmentsParam = UrlBuilderUtils.generateColumnsAndSegmentsParam(columns, segments);
+    String url = String.format("%s/tables/%s/segments/metadata", endpoint, tableNameWithType);
+    return columnsAndSegmentsParam != null ? url + "?" + columnsAndSegmentsParam : url;
+  }
+
+  private String generateCheckReloadSegmentsServerURL(String tableNameWithType, String endpoint) {
+    tableNameWithType = encode(tableNameWithType);
+    return String.format("%s/tables/%s/segments/needReload", endpoint, tableNameWithType);
+  }
+
+  private String generateValidDocIdsBitmapURL(String tableNameWithType, String segmentName, String validDocIdsType,
+      String endpoint) {
+    tableNameWithType = encode(tableNameWithType);
+    segmentName = encode(segmentName);
+    String url = String.format("%s/segments/%s/%s/validDocIdsBitmap", endpoint, tableNameWithType, segmentName);
+    return validDocIdsType != null ? url + "?validDocIdsType=" + validDocIdsType : url;
+  }
+
+  private Pair<String, String> generateValidDocIdsMetadataURL(String tableNameWithType, List<String> segmentNames,
+      String validDocIdsType, String endpoint) {
+    tableNameWithType = encode(tableNameWithType);
+    TableSegments tableSegments = new TableSegments(segmentNames);
+    String jsonTableSegments;
+    try {
+      jsonTableSegments = JsonUtils.objectToString(tableSegments);
+    } catch (JsonProcessingException e) {
+      LOGGER.error("Failed to convert segment names to json request body: segmentNames={}", segmentNames);
+      throw new RuntimeException(e);
+    }
+    String url = String.format("%s/tables/%s/validDocIdsMetadata", endpoint, tableNameWithType);
+    if (validDocIdsType != null) {
+      url = url + "?validDocIdsType=" + validDocIdsType;
+    }
+    return Pair.of(url, jsonTableSegments);
+  }
+
+  private String generateStaleSegmentsServerURL(String tableNameWithType, String endpoint) {
+    tableNameWithType = encode(tableNameWithType);
+    return String.format("%s/tables/%s/segments/isStale", endpoint, tableNameWithType);
+  }
+
+  private static String encode(String value) {
+    return URLEncoder.encode(value, StandardCharsets.UTF_8);
+  }
+
+  public static class TableReloadResponse {
+    private final int _numFailedResponses;
+    private final List<String> _serverReloadResponses;
+
+    private TableReloadResponse(int numFailedResponses, List<String> serverReloadResponses) {
+      _numFailedResponses = numFailedResponses;
+      _serverReloadResponses = serverReloadResponses;
+    }
+
+    public int getNumFailedResponses() {
+      return _numFailedResponses;
+    }
+
+    public List<String> getServerReloadResponses() {
+      return _serverReloadResponses;
+    }
+  }
+}

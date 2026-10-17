@@ -1,0 +1,716 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pinot.core.operator.filter.predicate;
+
+import com.google.common.base.Preconditions;
+import it.unimi.dsi.fastutil.ints.IntSet;
+import java.math.BigDecimal;
+import javax.annotation.Nullable;
+import org.apache.pinot.common.request.context.predicate.Predicate;
+import org.apache.pinot.common.request.context.predicate.RangePredicate;
+import org.apache.pinot.core.operator.filter.predicate.traits.DoubleRange;
+import org.apache.pinot.core.operator.filter.predicate.traits.FloatRange;
+import org.apache.pinot.core.operator.filter.predicate.traits.IntRange;
+import org.apache.pinot.core.operator.filter.predicate.traits.LongRange;
+import org.apache.pinot.segment.spi.index.reader.Dictionary;
+import org.apache.pinot.spi.data.FieldSpec.DataType;
+import org.apache.pinot.spi.utils.BooleanUtils;
+import org.apache.pinot.spi.utils.ByteArray;
+import org.apache.pinot.spi.utils.BytesUtils;
+import org.apache.pinot.spi.utils.TimestampUtils;
+import org.apache.pinot.spi.utils.UuidUtils;
+
+
+/// Factory for RANGE predicate evaluators.
+public class RangePredicateEvaluatorFactory {
+  private RangePredicateEvaluatorFactory() {
+  }
+
+  /// Create a new instance of dictionary based RANGE predicate evaluator.
+  ///
+  /// @param rangePredicate RANGE predicate to evaluate
+  /// @param dictionary Dictionary for the column
+  /// @param dataType Data type for the column
+  /// @return Dictionary based RANGE predicate evaluator
+  public static BaseDictionaryBasedPredicateEvaluator newDictionaryBasedEvaluator(RangePredicate rangePredicate,
+      Dictionary dictionary, DataType dataType) {
+    if (dictionary.isSorted()) {
+      return new SortedDictionaryBasedRangePredicateEvaluator(rangePredicate, dictionary, dataType);
+    } else {
+      return new UnsortedDictionaryBasedRangePredicateEvaluator(rangePredicate, dictionary, dataType);
+    }
+  }
+
+  /// Create a new instance of raw value based RANGE predicate evaluator.
+  ///
+  /// @param rangePredicate RANGE predicate to evaluate
+  /// @param dataType Data type for the column
+  /// @return Raw value based RANGE predicate evaluator
+  public static RangeRawPredicateEvaluator newRawValueBasedEvaluator(RangePredicate rangePredicate,
+      DataType dataType) {
+    String lowerBound = rangePredicate.getLowerBound();
+    String upperBound = rangePredicate.getUpperBound();
+    // NOTE: Handle unbounded as inclusive min/max value of the data type
+    boolean lowerUnbounded = lowerBound.equals(RangePredicate.UNBOUNDED);
+    boolean upperUnbounded = upperBound.equals(RangePredicate.UNBOUNDED);
+    boolean lowerInclusive = lowerUnbounded || rangePredicate.isLowerInclusive();
+    boolean upperInclusive = upperUnbounded || rangePredicate.isUpperInclusive();
+    switch (dataType) {
+      case INT:
+        return new IntRawValueBasedRangePredicateEvaluator(rangePredicate,
+            lowerUnbounded ? Integer.MIN_VALUE : Integer.parseInt(lowerBound),
+            upperUnbounded ? Integer.MAX_VALUE : Integer.parseInt(upperBound), lowerInclusive, upperInclusive);
+      case LONG:
+        return new LongRawValueBasedRangePredicateEvaluator(rangePredicate,
+            lowerUnbounded ? Long.MIN_VALUE : Long.parseLong(lowerBound),
+            upperUnbounded ? Long.MAX_VALUE : Long.parseLong(upperBound), lowerInclusive, upperInclusive);
+      case FLOAT:
+        return new FloatRawValueBasedRangePredicateEvaluator(rangePredicate,
+            lowerUnbounded ? Float.NEGATIVE_INFINITY : Float.parseFloat(lowerBound),
+            upperUnbounded ? Float.POSITIVE_INFINITY : Float.parseFloat(upperBound), lowerInclusive, upperInclusive);
+      case DOUBLE:
+        return new DoubleRawValueBasedRangePredicateEvaluator(rangePredicate,
+            lowerUnbounded ? Double.NEGATIVE_INFINITY : Double.parseDouble(lowerBound),
+            upperUnbounded ? Double.POSITIVE_INFINITY : Double.parseDouble(upperBound), lowerInclusive, upperInclusive);
+      case BIG_DECIMAL:
+        return new BigDecimalRawValueBasedRangePredicateEvaluator(rangePredicate,
+            lowerUnbounded ? null : new BigDecimal(lowerBound), upperUnbounded ? null : new BigDecimal(upperBound),
+            lowerInclusive, upperInclusive);
+      case BOOLEAN:
+        return new IntRawValueBasedRangePredicateEvaluator(rangePredicate,
+            lowerUnbounded ? Integer.MIN_VALUE : BooleanUtils.toInt(lowerBound),
+            upperUnbounded ? Integer.MAX_VALUE : BooleanUtils.toInt(upperBound), lowerInclusive, upperInclusive);
+      case TIMESTAMP:
+        return new LongRawValueBasedRangePredicateEvaluator(rangePredicate,
+            lowerUnbounded ? Long.MIN_VALUE : TimestampUtils.toMillisSinceEpoch(lowerBound),
+            upperUnbounded ? Long.MAX_VALUE : TimestampUtils.toMillisSinceEpoch(upperBound), lowerInclusive,
+            upperInclusive);
+      case STRING:
+        return new StringRawValueBasedRangePredicateEvaluator(rangePredicate, lowerUnbounded ? null : lowerBound,
+            upperUnbounded ? null : upperBound, lowerInclusive, upperInclusive);
+      case BYTES:
+        return new BytesRawValueBasedRangePredicateEvaluator(rangePredicate,
+            lowerUnbounded ? null : BytesUtils.toBytes(lowerBound),
+            upperUnbounded ? null : BytesUtils.toBytes(upperBound), lowerInclusive, upperInclusive);
+      // UUID is stored as 16 raw bytes and its unsigned bytewise ordering is exactly UUID ordering, so -- like
+      // TIMESTAMP over LONG above -- convert the bounds to the stored form and reuse the BYTES evaluator. UUID
+      // dictionaries also report getValueType() == BYTES, so the unsorted dictionary-based evaluator dispatches on
+      // BYTES and feeds this the raw 16-byte values, directly comparable to the bounds.
+      case UUID:
+        return new BytesRawValueBasedRangePredicateEvaluator(rangePredicate,
+            lowerUnbounded ? null : UuidUtils.toBytes(lowerBound),
+            upperUnbounded ? null : UuidUtils.toBytes(upperBound), lowerInclusive, upperInclusive);
+      default:
+        throw new IllegalStateException("Unsupported data type: " + dataType);
+    }
+  }
+
+  public static final class SortedDictionaryBasedRangePredicateEvaluator extends BaseDictionaryBasedPredicateEvaluator
+      implements IntRange {
+    final int _startDictId;
+    // Exclusive
+    final int _endDictId;
+    final int _numMatchingDictIds;
+
+    SortedDictionaryBasedRangePredicateEvaluator(RangePredicate rangePredicate, Dictionary dictionary,
+        DataType dataType) {
+      super(rangePredicate, dictionary);
+      String lowerBound = rangePredicate.getLowerBound();
+      String upperBound = rangePredicate.getUpperBound();
+      boolean lowerInclusive = rangePredicate.isLowerInclusive();
+      boolean upperInclusive = rangePredicate.isUpperInclusive();
+
+      if (lowerBound.equals(RangePredicate.UNBOUNDED)) {
+        _startDictId = 0;
+      } else {
+        int insertionIndex = dictionary.insertionIndexOf(PredicateUtils.getStoredValue(lowerBound, dataType));
+        if (insertionIndex < 0) {
+          _startDictId = -(insertionIndex + 1);
+        } else {
+          if (lowerInclusive) {
+            _startDictId = insertionIndex;
+          } else {
+            _startDictId = insertionIndex + 1;
+          }
+        }
+      }
+      if (upperBound.equals(RangePredicate.UNBOUNDED)) {
+        _endDictId = dictionary.length();
+      } else {
+        int insertionIndex = dictionary.insertionIndexOf(PredicateUtils.getStoredValue(upperBound, dataType));
+        if (insertionIndex < 0) {
+          _endDictId = -(insertionIndex + 1);
+        } else {
+          if (upperInclusive) {
+            _endDictId = insertionIndex + 1;
+          } else {
+            _endDictId = insertionIndex;
+          }
+        }
+      }
+
+      _numMatchingDictIds = Integer.max(_endDictId - _startDictId, 0);
+      if (_numMatchingDictIds == 0) {
+        _alwaysFalse = true;
+      } else if (dictionary.length() == _numMatchingDictIds) {
+        _alwaysTrue = true;
+      }
+    }
+
+    public int getStartDictId() {
+      return _startDictId;
+    }
+
+    public int getEndDictId() {
+      return _endDictId;
+    }
+
+    @Override
+    protected int[] calculateMatchingDictIds() {
+      if (_numMatchingDictIds == 0) {
+        return new int[0];
+      } else {
+        int[] matchingDictIds = new int[_numMatchingDictIds];
+        for (int i = 0; i < _numMatchingDictIds; i++) {
+          matchingDictIds[i] = _startDictId + i;
+        }
+        return matchingDictIds;
+      }
+    }
+
+    @Override
+    protected int[] calculateNonMatchingDictIds() {
+      int dictionarySize = _dictionary.length();
+      if (_numMatchingDictIds == 0) {
+        int[] nonMatchingDictIds = new int[dictionarySize];
+        for (int i = 0; i < dictionarySize; i++) {
+          nonMatchingDictIds[i] = i;
+        }
+        return nonMatchingDictIds;
+      } else {
+        int[] nonMatchingDictIds = new int[dictionarySize - _numMatchingDictIds];
+        int index = 0;
+        for (int i = 0; i < _startDictId; i++) {
+          nonMatchingDictIds[index++] = i;
+        }
+        for (int i = _endDictId; i < dictionarySize; i++) {
+          nonMatchingDictIds[index++] = i;
+        }
+        return nonMatchingDictIds;
+      }
+    }
+
+    @Override
+    public int getNumMatchingItems() {
+      return _numMatchingDictIds;
+    }
+
+    @Override
+    public boolean applySV(int dictId) {
+      return _startDictId <= dictId && _endDictId > dictId;
+    }
+
+    @Override
+    public int applySV(int limit, int[] docIds, int[] dictIds) {
+      // reimplemented here to ensure applySV can be inlined
+      int matches = 0;
+      for (int i = 0; i < limit; i++) {
+        int dictId = dictIds[i];
+        if (applySV(dictId)) {
+          docIds[matches++] = docIds[i];
+        }
+      }
+      return matches;
+    }
+
+    @Override
+    public int getInclusiveLowerBound() {
+      return getStartDictId();
+    }
+
+    @Override
+    public int getInclusiveUpperBound() {
+      return getEndDictId() - 1;
+    }
+  }
+
+  private static final class UnsortedDictionaryBasedRangePredicateEvaluator
+      extends BaseDictionaryBasedPredicateEvaluator {
+    // When the cardinality of the column is lower than this threshold, pre-calculate the matching dictionary ids;
+    // otherwise, fetch the value when evaluating each dictionary id.
+    // TODO: Tune this threshold
+    private static final int DICT_ID_SET_BASED_CARDINALITY_THRESHOLD = 1000;
+
+    final boolean _dictIdSetBased;
+    final IntSet _matchingDictIdSet;
+    final BaseRawValueBasedPredicateEvaluator _rawValueBasedEvaluator;
+
+    UnsortedDictionaryBasedRangePredicateEvaluator(RangePredicate rangePredicate, Dictionary dictionary,
+        DataType dataType) {
+      super(rangePredicate, dictionary);
+      int cardinality = dictionary.length();
+      if (cardinality < DICT_ID_SET_BASED_CARDINALITY_THRESHOLD) {
+        _dictIdSetBased = true;
+        _rawValueBasedEvaluator = null;
+        String lowerBound = rangePredicate.getLowerBound();
+        if (!lowerBound.equals(RangePredicate.UNBOUNDED)) {
+          lowerBound = PredicateUtils.getStoredValue(lowerBound, dataType);
+        }
+        String upperBound = rangePredicate.getUpperBound();
+        if (!upperBound.equals(RangePredicate.UNBOUNDED)) {
+          upperBound = PredicateUtils.getStoredValue(upperBound, dataType);
+        }
+        _matchingDictIdSet = dictionary.getDictIdsInRange(lowerBound, upperBound, rangePredicate.isLowerInclusive(),
+            rangePredicate.isUpperInclusive());
+        int numMatchingDictIds = _matchingDictIdSet.size();
+        if (numMatchingDictIds == 0) {
+          _alwaysFalse = true;
+        } else if (numMatchingDictIds == cardinality) {
+          _alwaysTrue = true;
+        }
+      } else {
+        _dictIdSetBased = false;
+        _matchingDictIdSet = null;
+        _rawValueBasedEvaluator = newRawValueBasedEvaluator(rangePredicate, dataType);
+      }
+    }
+
+    @Override
+    public int[] getMatchingDictIds() {
+      throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public int getNumMatchingItems() {
+      return _matchingDictIdSet != null ? _matchingDictIdSet.size() : Integer.MIN_VALUE;
+    }
+
+    @Override
+    public boolean applySV(int dictId) {
+      if (_dictIdSetBased) {
+        return _matchingDictIdSet.contains(dictId);
+      } else {
+        DataType storedType = _dictionary.getValueType();
+        switch (storedType) {
+          case INT:
+            return _rawValueBasedEvaluator.applySV(_dictionary.getIntValue(dictId));
+          case LONG:
+            return _rawValueBasedEvaluator.applySV(_dictionary.getLongValue(dictId));
+          case FLOAT:
+            return _rawValueBasedEvaluator.applySV(_dictionary.getFloatValue(dictId));
+          case DOUBLE:
+            return _rawValueBasedEvaluator.applySV(_dictionary.getDoubleValue(dictId));
+          case BIG_DECIMAL:
+            return _rawValueBasedEvaluator.applySV(_dictionary.getBigDecimalValue(dictId));
+          case STRING:
+            return _rawValueBasedEvaluator.applySV(_dictionary.getStringValue(dictId));
+          case BYTES:
+            return _rawValueBasedEvaluator.applySV(_dictionary.getBytesValue(dictId));
+          default:
+            throw new IllegalStateException("Unsupported stored type: " + storedType);
+        }
+      }
+    }
+  }
+
+  public static abstract class RangeRawPredicateEvaluator extends BaseRawValueBasedPredicateEvaluator {
+    public RangeRawPredicateEvaluator(Predicate predicate) {
+      super(predicate);
+    }
+
+    /// Visits the bounds of this predicate.
+    public abstract <R> R accept(Visitor<R> visitor);
+
+    /// Visitor for the bounds of a RANGE predicate, dispatched by the stored value type.
+    ///
+    /// For integral and floating point types, exclusive bounds are normalized to inclusive bounds, and unbounded
+    /// sides are normalized to the data type's min/max. For `BigDecimal`, `String`, and `byte[]`, the raw bounds are
+    /// passed through together with their inclusivity flags, and unbounded sides are represented by a `null` bound.
+    public interface Visitor<R> {
+      R visitInt(int inclusiveLowerBound, int inclusiveUpperBound);
+
+      R visitLong(long inclusiveLowerBound, long inclusiveUpperBound);
+
+      R visitFloat(float inclusiveLowerBound, float inclusiveUpperBound);
+
+      R visitDouble(double inclusiveLowerBound, double inclusiveUpperBound);
+
+      R visitBigDecimal(@Nullable BigDecimal lowerBound, @Nullable BigDecimal upperBound, boolean lowerInclusive,
+          boolean upperInclusive);
+
+      R visitString(@Nullable String lowerBound, @Nullable String upperBound, boolean lowerInclusive,
+          boolean upperInclusive);
+
+      R visitBytes(@Nullable byte[] lowerBound, @Nullable byte[] upperBound, boolean lowerInclusive,
+          boolean upperInclusive);
+    }
+  }
+
+  private static final class IntRawValueBasedRangePredicateEvaluator extends RangeRawPredicateEvaluator
+      implements IntRange {
+    final int _inclusiveLowerBound;
+    final int _inclusiveUpperBound;
+
+    IntRawValueBasedRangePredicateEvaluator(RangePredicate rangePredicate, int lowerBound, int upperBound,
+        boolean lowerInclusive, boolean upperInclusive) {
+      super(rangePredicate);
+      if (lowerInclusive) {
+        _inclusiveLowerBound = lowerBound;
+      } else {
+        _inclusiveLowerBound = lowerBound + 1;
+        Preconditions.checkArgument(_inclusiveLowerBound > lowerBound, "Invalid range: %s", rangePredicate);
+      }
+      if (upperInclusive) {
+        _inclusiveUpperBound = upperBound;
+      } else {
+        _inclusiveUpperBound = upperBound - 1;
+        Preconditions.checkArgument(_inclusiveUpperBound < upperBound, "Invalid range: %s", rangePredicate);
+      }
+    }
+
+    @Override
+    public int getInclusiveLowerBound() {
+      return _inclusiveLowerBound;
+    }
+
+    @Override
+    public int getInclusiveUpperBound() {
+      return _inclusiveUpperBound;
+    }
+
+    @Override
+    public DataType getDataType() {
+      return DataType.INT;
+    }
+
+    @Override
+    public boolean applySV(int value) {
+      return value >= _inclusiveLowerBound && value <= _inclusiveUpperBound;
+    }
+
+    @Override
+    public int applySV(int limit, int[] docIds, int[] values) {
+      // reimplemented here to ensure applySV can be inlined
+      int matches = 0;
+      for (int i = 0; i < limit; i++) {
+        int value = values[i];
+        if (applySV(value)) {
+          docIds[matches++] = docIds[i];
+        }
+      }
+      return matches;
+    }
+
+    @Override
+    public <R> R accept(Visitor<R> visitor) {
+      return visitor.visitInt(_inclusiveLowerBound, _inclusiveUpperBound);
+    }
+  }
+
+  private static final class LongRawValueBasedRangePredicateEvaluator extends RangeRawPredicateEvaluator
+      implements LongRange {
+    final long _inclusiveLowerBound;
+    final long _inclusiveUpperBound;
+
+    LongRawValueBasedRangePredicateEvaluator(RangePredicate rangePredicate, long lowerBound, long upperBound,
+        boolean lowerInclusive, boolean upperInclusive) {
+      super(rangePredicate);
+      if (lowerInclusive) {
+        _inclusiveLowerBound = lowerBound;
+      } else {
+        _inclusiveLowerBound = lowerBound + 1;
+        Preconditions.checkArgument(_inclusiveLowerBound > lowerBound, "Invalid range: %s", rangePredicate);
+      }
+      if (upperInclusive) {
+        _inclusiveUpperBound = upperBound;
+      } else {
+        _inclusiveUpperBound = upperBound - 1;
+        Preconditions.checkArgument(_inclusiveUpperBound < upperBound, "Invalid range: %s", rangePredicate);
+      }
+    }
+
+    @Override
+    public long getInclusiveLowerBound() {
+      return _inclusiveLowerBound;
+    }
+
+    @Override
+    public long getInclusiveUpperBound() {
+      return _inclusiveUpperBound;
+    }
+
+    @Override
+    public DataType getDataType() {
+      return DataType.LONG;
+    }
+
+    @Override
+    public boolean applySV(long value) {
+      return value >= _inclusiveLowerBound && value <= _inclusiveUpperBound;
+    }
+
+    @Override
+    public int applySV(int limit, int[] docIds, long[] values) {
+      // reimplemented here to ensure applySV can be inlined
+      int matches = 0;
+      for (int i = 0; i < limit; i++) {
+        long value = values[i];
+        if (applySV(value)) {
+          docIds[matches++] = docIds[i];
+        }
+      }
+      return matches;
+    }
+
+    @Override
+    public <R> R accept(Visitor<R> visitor) {
+      return visitor.visitLong(_inclusiveLowerBound, _inclusiveUpperBound);
+    }
+  }
+
+  private static final class FloatRawValueBasedRangePredicateEvaluator extends RangeRawPredicateEvaluator
+      implements FloatRange {
+    final float _inclusiveLowerBound;
+    final float _inclusiveUpperBound;
+
+    FloatRawValueBasedRangePredicateEvaluator(RangePredicate rangePredicate, float lowerBound, float upperBound,
+        boolean lowerInclusive, boolean upperInclusive) {
+      super(rangePredicate);
+      if (lowerInclusive) {
+        _inclusiveLowerBound = lowerBound;
+      } else {
+        _inclusiveLowerBound = Math.nextUp(lowerBound);
+        Preconditions.checkArgument(_inclusiveLowerBound > lowerBound, "Invalid range: %s", rangePredicate);
+      }
+      if (upperInclusive) {
+        _inclusiveUpperBound = upperBound;
+      } else {
+        _inclusiveUpperBound = Math.nextDown(upperBound);
+        Preconditions.checkArgument(_inclusiveUpperBound < upperBound, "Invalid range: %s", rangePredicate);
+      }
+    }
+
+    @Override
+    public float getInclusiveLowerBound() {
+      return _inclusiveLowerBound;
+    }
+
+    @Override
+    public float getInclusiveUpperBound() {
+      return _inclusiveUpperBound;
+    }
+
+    @Override
+    public DataType getDataType() {
+      return DataType.FLOAT;
+    }
+
+    @Override
+    public boolean applySV(float value) {
+      return value >= _inclusiveLowerBound && value <= _inclusiveUpperBound;
+    }
+
+    @Override
+    public int applySV(int limit, int[] docIds, float[] values) {
+      // reimplemented here to ensure applySV can be inlined
+      int matches = 0;
+      for (int i = 0; i < limit; i++) {
+        float value = values[i];
+        if (applySV(value)) {
+          docIds[matches++] = docIds[i];
+        }
+      }
+      return matches;
+    }
+
+    @Override
+    public <R> R accept(Visitor<R> visitor) {
+      return visitor.visitFloat(_inclusiveLowerBound, _inclusiveUpperBound);
+    }
+  }
+
+  private static final class DoubleRawValueBasedRangePredicateEvaluator extends RangeRawPredicateEvaluator
+      implements DoubleRange {
+    final double _inclusiveLowerBound;
+    final double _inclusiveUpperBound;
+
+    DoubleRawValueBasedRangePredicateEvaluator(RangePredicate rangePredicate, double lowerBound, double upperBound,
+        boolean lowerInclusive, boolean upperInclusive) {
+      super(rangePredicate);
+      if (lowerInclusive) {
+        _inclusiveLowerBound = lowerBound;
+      } else {
+        _inclusiveLowerBound = Math.nextUp(lowerBound);
+        Preconditions.checkArgument(_inclusiveLowerBound > lowerBound, "Invalid range: %s", rangePredicate);
+      }
+      if (upperInclusive) {
+        _inclusiveUpperBound = upperBound;
+      } else {
+        _inclusiveUpperBound = Math.nextDown(upperBound);
+        Preconditions.checkArgument(_inclusiveUpperBound < upperBound, "Invalid range: %s", rangePredicate);
+      }
+    }
+
+    @Override
+    public double getInclusiveLowerBound() {
+      return _inclusiveLowerBound;
+    }
+
+    @Override
+    public double getInclusiveUpperBound() {
+      return _inclusiveUpperBound;
+    }
+
+    @Override
+    public DataType getDataType() {
+      return DataType.DOUBLE;
+    }
+
+    @Override
+    public boolean applySV(double value) {
+      return value >= _inclusiveLowerBound && value <= _inclusiveUpperBound;
+    }
+
+    @Override
+    public int applySV(int limit, int[] docIds, double[] values) {
+      // reimplemented here to ensure applySV can be inlined
+      int matches = 0;
+      for (int i = 0; i < limit; i++) {
+        double value = values[i];
+        if (applySV(value)) {
+          docIds[matches++] = docIds[i];
+        }
+      }
+      return matches;
+    }
+
+    @Override
+    public <R> R accept(Visitor<R> visitor) {
+      return visitor.visitDouble(_inclusiveLowerBound, _inclusiveUpperBound);
+    }
+  }
+
+  public static final class BigDecimalRawValueBasedRangePredicateEvaluator extends RangeRawPredicateEvaluator {
+    final BigDecimal _lowerBound;
+    final BigDecimal _upperBound;
+    final boolean _lowerInclusive;
+    final boolean _upperInclusive;
+    final int _lowerComparisonValue;
+    final int _upperComparisonValue;
+
+    BigDecimalRawValueBasedRangePredicateEvaluator(RangePredicate rangePredicate, BigDecimal lowerBound,
+        BigDecimal upperBound, boolean lowerInclusive, boolean upperInclusive) {
+      super(rangePredicate);
+      _lowerBound = lowerBound;
+      _upperBound = upperBound;
+      _lowerInclusive = lowerInclusive;
+      _upperInclusive = upperInclusive;
+      _lowerComparisonValue = lowerInclusive ? 0 : 1;
+      _upperComparisonValue = upperInclusive ? 0 : -1;
+    }
+
+    @Override
+    public DataType getDataType() {
+      return DataType.BIG_DECIMAL;
+    }
+
+    @Override
+    public boolean applySV(BigDecimal value) {
+      return (_lowerBound == null || value.compareTo(_lowerBound) >= _lowerComparisonValue) && (_upperBound == null
+          || value.compareTo(_upperBound) <= _upperComparisonValue);
+    }
+
+    @Override
+    public <R> R accept(Visitor<R> visitor) {
+      return visitor.visitBigDecimal(_lowerBound, _upperBound, _lowerInclusive, _upperInclusive);
+    }
+  }
+
+  private static final class StringRawValueBasedRangePredicateEvaluator extends RangeRawPredicateEvaluator {
+    final String _lowerBound;
+    final String _upperBound;
+    final boolean _lowerInclusive;
+    final boolean _upperInclusive;
+    final int _lowerComparisonValue;
+    final int _upperComparisonValue;
+
+    StringRawValueBasedRangePredicateEvaluator(RangePredicate rangePredicate, String lowerBound, String upperBound,
+        boolean lowerInclusive, boolean upperInclusive) {
+      super(rangePredicate);
+      _lowerBound = lowerBound;
+      _upperBound = upperBound;
+      _lowerInclusive = lowerInclusive;
+      _upperInclusive = upperInclusive;
+      _lowerComparisonValue = lowerInclusive ? 0 : 1;
+      _upperComparisonValue = upperInclusive ? 0 : -1;
+    }
+
+    @Override
+    public DataType getDataType() {
+      return DataType.STRING;
+    }
+
+    @Override
+    public boolean applySV(String value) {
+      return (_lowerBound == null || value.compareTo(_lowerBound) >= _lowerComparisonValue) && (_upperBound == null
+          || value.compareTo(_upperBound) <= _upperComparisonValue);
+    }
+
+    @Override
+    public <R> R accept(Visitor<R> visitor) {
+      return visitor.visitString(_lowerBound, _upperBound, _lowerInclusive, _upperInclusive);
+    }
+  }
+
+  private static final class BytesRawValueBasedRangePredicateEvaluator extends RangeRawPredicateEvaluator {
+    final byte[] _lowerBound;
+    final byte[] _upperBound;
+    final boolean _lowerInclusive;
+    final boolean _upperInclusive;
+    final int _lowerComparisonValue;
+    final int _upperComparisonValue;
+
+    BytesRawValueBasedRangePredicateEvaluator(RangePredicate rangePredicate, byte[] lowerBound, byte[] upperBound,
+        boolean lowerInclusive, boolean upperInclusive) {
+      super(rangePredicate);
+      _lowerBound = lowerBound;
+      _upperBound = upperBound;
+      _lowerInclusive = lowerInclusive;
+      _upperInclusive = upperInclusive;
+      _lowerComparisonValue = lowerInclusive ? 0 : 1;
+      _upperComparisonValue = upperInclusive ? 0 : -1;
+    }
+
+    @Override
+    public DataType getDataType() {
+      return DataType.BYTES;
+    }
+
+    @Override
+    public boolean applySV(byte[] value) {
+      return (_lowerBound == null || ByteArray.compare(value, _lowerBound) >= _lowerComparisonValue) && (
+          _upperBound == null || ByteArray.compare(value, _upperBound) <= _upperComparisonValue);
+    }
+
+    @Override
+    public <R> R accept(Visitor<R> visitor) {
+      return visitor.visitBytes(_lowerBound, _upperBound, _lowerInclusive, _upperInclusive);
+    }
+  }
+}

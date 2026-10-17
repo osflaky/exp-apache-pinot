@@ -1,0 +1,104 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pinot.core.query.aggregation.function.array;
+
+import it.unimi.dsi.fastutil.objects.ObjectOpenHashSet;
+import it.unimi.dsi.fastutil.objects.ObjectSet;
+import java.util.Map;
+import org.apache.pinot.common.CustomObject;
+import org.apache.pinot.common.request.context.ExpressionContext;
+import org.apache.pinot.core.common.BlockValSet;
+import org.apache.pinot.core.common.ObjectSerDeUtils;
+import org.apache.pinot.core.query.aggregation.AggregationResultHolder;
+import org.apache.pinot.core.query.aggregation.groupby.GroupByResultHolder;
+import org.apache.pinot.core.startree.StarTreePreAggregatedBlockValSet;
+import org.apache.pinot.segment.local.aggregator.ArrayAggDistinctValueAggregator.ElementType;
+
+
+public class ArrayAggDistinctStringFunction extends BaseArrayAggStringFunction<ObjectSet<String>> {
+  public ArrayAggDistinctStringFunction(ExpressionContext expression, boolean nullHandlingEnabled) {
+    super(expression, nullHandlingEnabled);
+  }
+
+  @Override
+  public boolean canUseStarTree(Map<String, Object> functionParameters) {
+    return true;
+  }
+
+  @Override
+  public void aggregate(int length, AggregationResultHolder aggregationResultHolder,
+      Map<ExpressionContext, BlockValSet> blockValSetMap) {
+    BlockValSet blockValSet = blockValSetMap.get(_expression);
+    ObjectOpenHashSet<String> valueSet =
+        aggregationResultHolder.getResult() != null ? aggregationResultHolder.getResult()
+            : new ObjectOpenHashSet<>(length);
+    // Star-tree pre-aggregated column: each single-value BYTES entry is a serialized distinct set to merge in.
+    if (blockValSet instanceof StarTreePreAggregatedBlockValSet) {
+      byte[][] bytesValues = blockValSet.getBytesValuesSV();
+      forEachNotNull(length, blockValSet, (from, to) -> {
+        for (int i = from; i < to; i++) {
+          valueSet.addAll(ObjectSerDeUtils.STRING_SET_SER_DE.deserialize(starTreeSetPayload(bytesValues[i],
+              ElementType.STRING)));
+        }
+      });
+      aggregationResultHolder.setValue(valueSet);
+      return;
+    }
+    if (blockValSet.isSingleValue()) {
+      String[] values = blockValSet.getStringValuesSV();
+      forEachNotNull(length, blockValSet, (from, to) -> {
+        for (int i = from; i < to; i++) {
+          valueSet.add(values[i]);
+        }
+      });
+    } else {
+      String[][] valuesArray = blockValSet.getStringValuesMV();
+      forEachNotNull(length, blockValSet, (from, to) -> {
+        for (int i = from; i < to; i++) {
+          String[] values = valuesArray[i];
+          for (String v : values) {
+            valueSet.add(v);
+          }
+        }
+      });
+    }
+    aggregationResultHolder.setValue(valueSet);
+  }
+
+  @Override
+  protected void setGroupByResult(GroupByResultHolder resultHolder, int groupKey, String value) {
+    ObjectOpenHashSet<String> valueSet = resultHolder.getResult(groupKey);
+    if (valueSet == null) {
+      valueSet = new ObjectOpenHashSet<>();
+      resultHolder.setValueForKey(groupKey, valueSet);
+    }
+    valueSet.add(value);
+  }
+
+  @Override
+  public SerializedIntermediateResult serializeIntermediateResult(ObjectSet<String> stringSet) {
+    return new SerializedIntermediateResult(ObjectSerDeUtils.ObjectType.StringSet.getValue(),
+        ObjectSerDeUtils.STRING_SET_SER_DE.serialize(stringSet));
+  }
+
+  @Override
+  public ObjectSet<String> deserializeIntermediateResult(CustomObject customObject) {
+    return (ObjectSet<String>) ObjectSerDeUtils.STRING_SET_SER_DE.deserialize(customObject.getBuffer());
+  }
+}

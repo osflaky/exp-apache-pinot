@@ -1,0 +1,598 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pinot.spi.config.table;
+
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.annotation.JsonPropertyDescription;
+import com.google.common.base.Preconditions;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import javax.annotation.Nullable;
+import org.apache.pinot.spi.config.BaseJsonConfig;
+import org.apache.pinot.spi.config.table.assignment.InstanceAssignmentConfig;
+import org.apache.pinot.spi.config.table.assignment.InstancePartitionsType;
+import org.apache.pinot.spi.config.table.assignment.SegmentAssignmentConfig;
+import org.apache.pinot.spi.config.table.ingestion.IngestionConfig;
+import org.apache.pinot.spi.config.table.sampler.TableSamplerConfig;
+import org.apache.pinot.spi.utils.CommonConstants;
+import org.apache.pinot.spi.utils.builder.TableNameBuilder;
+
+
+@SuppressWarnings("unused")
+public class TableConfig extends BaseJsonConfig {
+  public static final String TABLE_NAME_KEY = "tableName";
+  public static final String TABLE_TYPE_KEY = "tableType";
+  public static final String IS_DIM_TABLE_KEY = "isDimTable";
+  public static final String IS_MATERIALIZED_VIEW_KEY = "isMaterializedView";
+  public static final String VALIDATION_CONFIG_KEY = "segmentsConfig";
+  public static final String TENANT_CONFIG_KEY = "tenants";
+  public static final String INDEXING_CONFIG_KEY = "tableIndexConfig";
+  public static final String CUSTOM_CONFIG_KEY = "metadata";
+  public static final String QUOTA_CONFIG_KEY = "quota";
+  public static final String TASK_CONFIG_KEY = "task";
+  public static final String ROUTING_CONFIG_KEY = "routing";
+  public static final String QUERY_CONFIG_KEY = "query";
+  public static final String INSTANCE_ASSIGNMENT_CONFIG_MAP_KEY = "instanceAssignmentConfigMap";
+  public static final String INSTANCE_PARTITIONS_MAP_CONFIG_KEY = "instancePartitionsMap";
+  public static final String SEGMENT_ASSIGNMENT_CONFIG_MAP_KEY = "segmentAssignmentConfigMap";
+  public static final String FIELD_CONFIG_LIST_KEY = "fieldConfigList";
+  public static final String UPSERT_CONFIG_KEY = "upsertConfig";
+  public static final String DEDUP_CONFIG_KEY = "dedupConfig";
+  public static final String DIMENSION_TABLE_CONFIG_KEY = "dimensionTableConfig";
+  public static final String INGESTION_CONFIG_KEY = "ingestionConfig";
+  public static final String TIER_CONFIGS_LIST_KEY = "tierConfigs";
+  public static final String TUNER_CONFIG_LIST_KEY = "tunerConfigs";
+  public static final String TIER_OVERWRITES_KEY = "tierOverwrites";
+  public static final String PAGE_CACHE_WARMUP_CONFIG_KEY = "pageCacheWarmupConfig";
+  public static final String TABLE_SAMPLERS_KEY = "tableSamplers";
+  public static final String DESCRIPTION_KEY = "description";
+  public static final String TAGS_KEY = "tags";
+
+  // Double underscore is reserved for real-time segment name delimiter
+  public static final String TABLE_NAME_FORBIDDEN_SUBSTRING = "__";
+
+  /* MANDATORY FIELDS */
+
+  @JsonPropertyDescription("The name for the table (with type suffix), e.g. \"myTable_OFFLINE\" (mandatory)")
+  private String _tableName;
+
+  @JsonPropertyDescription(value = "The type of the table (OFFLINE|REALTIME) (mandatory)")
+  private final TableType _tableType;
+
+  @JsonPropertyDescription("Indicates whether the table is a dimension table or not")
+  private final boolean _dimTable;
+
+  @JsonPropertyDescription("Indicates whether the table is a materialized view or not")
+  private final boolean _materializedView;
+
+  private SegmentsValidationAndRetentionConfig _validationConfig;
+  private TenantConfig _tenantConfig;
+  private IndexingConfig _indexingConfig;
+
+  /* OPTIONAL FIELDS */
+
+  @JsonPropertyDescription("Human-readable description of the table, supports markdown")
+  @JsonInclude(JsonInclude.Include.NON_EMPTY)
+  private String _description;
+
+  @JsonPropertyDescription("Tags for categorizing and filtering the table")
+  @JsonInclude(JsonInclude.Include.NON_EMPTY)
+  @Nullable
+  private List<String> _tags;
+
+  private TableCustomConfig _customConfig;
+
+  @JsonPropertyDescription("Resource quota associated with this table")
+  private QuotaConfig _quotaConfig;
+
+  private TableTaskConfig _taskConfig;
+  private RoutingConfig _routingConfig;
+  private QueryConfig _queryConfig;
+  private Map<String, InstanceAssignmentConfig> _instanceAssignmentConfigMap;
+
+  @JsonPropertyDescription(value = "Point to an existing instance partitions")
+  private Map<InstancePartitionsType, String> _instancePartitionsMap;
+
+  private Map<String, SegmentAssignmentConfig> _segmentAssignmentConfigMap;
+  private List<FieldConfig> _fieldConfigList;
+
+  @JsonPropertyDescription(value = "Upsert related config")
+  private UpsertConfig _upsertConfig;
+
+  @JsonPropertyDescription(value = "Dedup related config")
+  private DedupConfig _dedupConfig;
+
+  @JsonPropertyDescription(value = "Dimension Table related config")
+  private DimensionTableConfig _dimensionTableConfig;
+
+  @JsonPropertyDescription(value = "Config related to ingesting data into the table")
+  private IngestionConfig _ingestionConfig;
+
+  @JsonPropertyDescription(value = "Configs for tiers of storage")
+  private List<TierConfig> _tierConfigsList;
+
+  @JsonPropertyDescription(value = "Configs for Table config tuner")
+  private List<TunerConfig> _tunerConfigList;
+
+  @JsonPropertyDescription(value = "Page cache warmup configuration")
+  private PageCacheWarmupConfig _pageCacheWarmupConfig;
+
+  @JsonPropertyDescription(value = "Configs for table samplers")
+  private List<TableSamplerConfig> _tableSamplers;
+
+  /// Legacy constructor preserved for binary backward-compatibility on the public SPI surface.
+  /// Callers compiled against the pre-`isMaterializedView` signature still link against this entry
+  /// point; it forwards to the canonical constructor with `materializedView=false`. Prefer the
+  /// [TableConfigBuilder] or the canonical constructor below for new code.
+  @Deprecated
+  public TableConfig(String tableName, String tableType,
+      SegmentsValidationAndRetentionConfig validationConfig, TenantConfig tenantConfig,
+      IndexingConfig indexingConfig, TableCustomConfig customConfig, @Nullable QuotaConfig quotaConfig,
+      @Nullable TableTaskConfig taskConfig, @Nullable RoutingConfig routingConfig,
+      @Nullable QueryConfig queryConfig,
+      @Nullable Map<String, InstanceAssignmentConfig> instanceAssignmentConfigMap,
+      @Nullable List<FieldConfig> fieldConfigList, @Nullable UpsertConfig upsertConfig,
+      @Nullable DedupConfig dedupConfig, @Nullable DimensionTableConfig dimensionTableConfig,
+      @Nullable IngestionConfig ingestionConfig, @Nullable List<TierConfig> tierConfigsList, boolean dimTable,
+      @Nullable List<TunerConfig> tunerConfigList,
+      @Nullable Map<InstancePartitionsType, String> instancePartitionsMap,
+      @Nullable Map<String, SegmentAssignmentConfig> segmentAssignmentConfigMap,
+      @Nullable List<TableSamplerConfig> tableSamplers) {
+    this(tableName, tableType, validationConfig, tenantConfig, indexingConfig, customConfig, quotaConfig, taskConfig,
+        routingConfig, queryConfig, instanceAssignmentConfigMap, fieldConfigList, upsertConfig, dedupConfig,
+        dimensionTableConfig, ingestionConfig, tierConfigsList, dimTable, tunerConfigList, instancePartitionsMap,
+        segmentAssignmentConfigMap, tableSamplers, /*materializedView=*/ false, /*pageCacheWarmupConfig=*/ null);
+  }
+
+  @JsonCreator
+  public TableConfig(@JsonProperty(value = TABLE_NAME_KEY, required = true) String tableName,
+      @JsonProperty(value = TABLE_TYPE_KEY, required = true) String tableType,
+      @JsonProperty(value = VALIDATION_CONFIG_KEY, required = true)
+      SegmentsValidationAndRetentionConfig validationConfig,
+      @JsonProperty(value = TENANT_CONFIG_KEY, required = true) TenantConfig tenantConfig,
+      @JsonProperty(value = INDEXING_CONFIG_KEY, required = true) IndexingConfig indexingConfig,
+      @JsonProperty(value = CUSTOM_CONFIG_KEY) TableCustomConfig customConfig,
+      @JsonProperty(QUOTA_CONFIG_KEY) @Nullable QuotaConfig quotaConfig,
+      @JsonProperty(TASK_CONFIG_KEY) @Nullable TableTaskConfig taskConfig,
+      @JsonProperty(ROUTING_CONFIG_KEY) @Nullable RoutingConfig routingConfig,
+      @JsonProperty(QUERY_CONFIG_KEY) @Nullable QueryConfig queryConfig,
+      @JsonProperty(INSTANCE_ASSIGNMENT_CONFIG_MAP_KEY) @Nullable
+      Map<String, InstanceAssignmentConfig> instanceAssignmentConfigMap,
+      @JsonProperty(FIELD_CONFIG_LIST_KEY) @Nullable List<FieldConfig> fieldConfigList,
+      @JsonProperty(UPSERT_CONFIG_KEY) @Nullable UpsertConfig upsertConfig,
+      @JsonProperty(DEDUP_CONFIG_KEY) @Nullable DedupConfig dedupConfig,
+      @JsonProperty(DIMENSION_TABLE_CONFIG_KEY) @Nullable DimensionTableConfig dimensionTableConfig,
+      @JsonProperty(INGESTION_CONFIG_KEY) @Nullable IngestionConfig ingestionConfig,
+      @JsonProperty(TIER_CONFIGS_LIST_KEY) @Nullable List<TierConfig> tierConfigsList,
+      @JsonProperty(IS_DIM_TABLE_KEY) boolean dimTable,
+      @JsonProperty(TUNER_CONFIG_LIST_KEY) @Nullable List<TunerConfig> tunerConfigList,
+      @JsonProperty(INSTANCE_PARTITIONS_MAP_CONFIG_KEY) @Nullable
+      Map<InstancePartitionsType, String> instancePartitionsMap,
+      @JsonProperty(SEGMENT_ASSIGNMENT_CONFIG_MAP_KEY) @Nullable
+      Map<String, SegmentAssignmentConfig> segmentAssignmentConfigMap,
+      @JsonProperty(TABLE_SAMPLERS_KEY) @Nullable List<TableSamplerConfig> tableSamplers,
+      @JsonProperty(IS_MATERIALIZED_VIEW_KEY) boolean materializedView,
+      @JsonProperty(PAGE_CACHE_WARMUP_CONFIG_KEY) @Nullable PageCacheWarmupConfig pageCacheWarmupConfig) {
+    Preconditions.checkArgument(tableName != null, "'tableName' must be configured");
+    Preconditions.checkArgument(!tableName.contains(TABLE_NAME_FORBIDDEN_SUBSTRING),
+        "'tableName' cannot contain double underscore ('__')");
+    Preconditions.checkArgument(tableType != null, "'tableType' must be configured");
+    Preconditions.checkArgument(validationConfig != null, "'segmentsConfig' must be configured");
+    Preconditions.checkArgument(tenantConfig != null, "'tenants' must be configured");
+    Preconditions.checkArgument(indexingConfig != null, "'tableIndexConfig' must be configured");
+
+    // NOTE: Handle lower case table type and raw table name for backward-compatibility
+    _tableType = TableType.valueOf(tableType.toUpperCase());
+    _tableName = TableNameBuilder.forType(_tableType).tableNameWithType(tableName);
+    _validationConfig = validationConfig;
+    _tenantConfig = tenantConfig;
+    _indexingConfig = indexingConfig;
+    _customConfig = customConfig;
+    _quotaConfig = quotaConfig;
+    _taskConfig = taskConfig;
+    _routingConfig = routingConfig;
+    _queryConfig = queryConfig;
+    _instanceAssignmentConfigMap = instanceAssignmentConfigMap;
+    _fieldConfigList = fieldConfigList;
+    _upsertConfig = upsertConfig;
+    _dedupConfig = dedupConfig;
+    _dimensionTableConfig = dimensionTableConfig;
+    _ingestionConfig = ingestionConfig;
+    _tierConfigsList = tierConfigsList;
+    _dimTable = dimTable;
+    _materializedView = materializedView;
+    _tunerConfigList = tunerConfigList;
+    _instancePartitionsMap = instancePartitionsMap;
+    _segmentAssignmentConfigMap = segmentAssignmentConfigMap;
+    _tableSamplers = sanitizeAndValidateTableSamplers(tableSamplers);
+    _pageCacheWarmupConfig = pageCacheWarmupConfig;
+  }
+
+  public TableConfig(TableConfig tableConfig) {
+    _tableType = tableConfig.getTableType();
+    _tableName = tableConfig.getTableName();
+    _validationConfig = tableConfig.getValidationConfig();
+    _tenantConfig = tableConfig.getTenantConfig();
+    _indexingConfig = tableConfig.getIndexingConfig();
+    _customConfig = tableConfig.getCustomConfig();
+    _quotaConfig = tableConfig.getQuotaConfig();
+    _taskConfig = tableConfig.getTaskConfig();
+    _routingConfig = tableConfig.getRoutingConfig();
+    _queryConfig = tableConfig.getQueryConfig();
+    _instanceAssignmentConfigMap = tableConfig.getInstanceAssignmentConfigMap();
+    _fieldConfigList = tableConfig.getFieldConfigList();
+    _upsertConfig = tableConfig.getUpsertConfig();
+    _dedupConfig = tableConfig.getDedupConfig();
+    _dimensionTableConfig = tableConfig.getDimensionTableConfig();
+    _ingestionConfig = tableConfig.getIngestionConfig();
+    _tierConfigsList = tableConfig.getTierConfigsList();
+    _dimTable = tableConfig.isDimTable();
+    _materializedView = tableConfig.isMaterializedView();
+    _tunerConfigList = tableConfig.getTunerConfigsList();
+    _instancePartitionsMap = tableConfig.getInstancePartitionsMap();
+    _segmentAssignmentConfigMap = tableConfig.getSegmentAssignmentConfigMap();
+    _pageCacheWarmupConfig = tableConfig.getPageCacheWarmupConfig();
+    _tableSamplers = sanitizeAndValidateTableSamplers(tableConfig.getTableSamplers());
+    _description = tableConfig.getDescription();
+    _tags = tableConfig.getTags();
+  }
+
+  @JsonProperty(TABLE_NAME_KEY)
+  public String getTableName() {
+    return _tableName;
+  }
+
+  public void setTableName(String tableNameWithType) {
+    Preconditions.checkArgument(tableNameWithType != null, "'tableName' must be configured");
+    _tableName = tableNameWithType;
+  }
+
+  @JsonProperty(DESCRIPTION_KEY)
+  @Nullable
+  public String getDescription() {
+    return _description;
+  }
+
+  public void setDescription(@Nullable String description) {
+    _description = description;
+  }
+
+  @JsonProperty(TAGS_KEY)
+  @Nullable
+  public List<String> getTags() {
+    return _tags;
+  }
+
+  public void setTags(@Nullable List<String> tags) {
+    _tags = tags;
+  }
+
+  @JsonProperty(TABLE_TYPE_KEY)
+  public TableType getTableType() {
+    return _tableType;
+  }
+
+  @JsonProperty(IS_DIM_TABLE_KEY)
+  public boolean isDimTable() {
+    return _dimTable;
+  }
+
+  @JsonProperty(IS_MATERIALIZED_VIEW_KEY)
+  public boolean isMaterializedView() {
+    return _materializedView;
+  }
+
+  /// Returns task configs for [CommonConstants.MaterializedViewTask#TASK_TYPE], or null if absent.
+  @JsonIgnore
+  @Nullable
+  public Map<String, String> getMaterializedViewTaskConfigs() {
+    if (_taskConfig == null) {
+      return null;
+    }
+    return _taskConfig.getConfigsForTaskType(CommonConstants.MaterializedViewTask.TASK_TYPE);
+  }
+
+  /// Whether the table has a non-empty `definedSQL` under any registered MV-style task type.
+  ///
+  /// Recognizes both the built-in OSS [CommonConstants.MaterializedViewTask#TASK_TYPE] and any
+  /// downstream task variant (e.g. StarTree's `MseMaterializedViewTask` for multi-stage MVs) by
+  /// scanning every task config for a non-empty `definedSQL` key. This keeps the
+  /// `isMaterializedView=true` invariant compatible with the wider ecosystem without OSS having to
+  /// hard-code each variant's task-type label.
+  @JsonIgnore
+  public boolean hasMaterializedViewTaskWithDefinedSql() {
+    if (_taskConfig == null) {
+      return false;
+    }
+    Map<String, Map<String, String>> taskTypeConfigsMap = _taskConfig.getTaskTypeConfigsMap();
+    if (taskTypeConfigsMap == null) {
+      return false;
+    }
+    for (Map<String, String> configs : taskTypeConfigsMap.values()) {
+      if (configs == null) {
+        continue;
+      }
+      String definedSql = configs.get(CommonConstants.MaterializedViewTask.DEFINED_SQL_KEY);
+      if (definedSql != null && !definedSql.trim().isEmpty()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  @JsonProperty(VALIDATION_CONFIG_KEY)
+  public SegmentsValidationAndRetentionConfig getValidationConfig() {
+    return _validationConfig;
+  }
+
+  public void setValidationConfig(SegmentsValidationAndRetentionConfig validationConfig) {
+    Preconditions.checkArgument(validationConfig != null, "'segmentsConfig' must be configured");
+    _validationConfig = validationConfig;
+  }
+
+  @JsonProperty(TENANT_CONFIG_KEY)
+  public TenantConfig getTenantConfig() {
+    return _tenantConfig;
+  }
+
+  public void setTenantConfig(TenantConfig tenantConfig) {
+    Preconditions.checkArgument(tenantConfig != null, "'tenants' must be configured");
+    _tenantConfig = tenantConfig;
+  }
+
+  @JsonProperty(INDEXING_CONFIG_KEY)
+  public IndexingConfig getIndexingConfig() {
+    return _indexingConfig;
+  }
+
+  public void setIndexingConfig(IndexingConfig indexingConfig) {
+    Preconditions.checkArgument(indexingConfig != null, "'tableIndexConfig' must be configured");
+    _indexingConfig = indexingConfig;
+  }
+
+  @JsonProperty(CUSTOM_CONFIG_KEY)
+  public TableCustomConfig getCustomConfig() {
+    return (_customConfig == null) ? new TableCustomConfig(Map.of()) : _customConfig;
+  }
+
+  public void setCustomConfig(TableCustomConfig customConfig) {
+    _customConfig = customConfig;
+  }
+
+  @JsonProperty(TABLE_SAMPLERS_KEY)
+  @Nullable
+  public List<TableSamplerConfig> getTableSamplers() {
+    return _tableSamplers;
+  }
+
+  public void setTableSamplers(@Nullable List<TableSamplerConfig> tableSamplers) {
+    _tableSamplers = sanitizeAndValidateTableSamplers(tableSamplers);
+  }
+
+  @Nullable
+  private static List<TableSamplerConfig> sanitizeAndValidateTableSamplers(
+      @Nullable List<TableSamplerConfig> tableSamplers) {
+    if (tableSamplers == null || tableSamplers.isEmpty()) {
+      return null;
+    }
+    List<TableSamplerConfig> sanitized = new ArrayList<>(tableSamplers.size());
+    Set<String> seenNormalizedNames = new HashSet<>();
+    for (TableSamplerConfig config : tableSamplers) {
+      if (config != null) {
+        String name = config.getName();
+        if (name != null) {
+          String trimmedName = name.trim();
+          if (trimmedName.isEmpty()) {
+            throw new IllegalArgumentException("Table sampler name cannot be blank");
+          }
+          String normalizedName = trimmedName.toLowerCase(Locale.ROOT);
+          if (!seenNormalizedNames.add(normalizedName)) {
+            throw new IllegalArgumentException("Duplicate table sampler name: " + trimmedName);
+          }
+        }
+        sanitized.add(config);
+      }
+    }
+    if (sanitized.isEmpty()) {
+      return null;
+    }
+    return sanitized;
+  }
+
+  @JsonProperty(QUOTA_CONFIG_KEY)
+  @Nullable
+  public QuotaConfig getQuotaConfig() {
+    return _quotaConfig;
+  }
+
+  public void setQuotaConfig(QuotaConfig quotaConfig) {
+    _quotaConfig = quotaConfig;
+  }
+
+  @JsonProperty(TASK_CONFIG_KEY)
+  @Nullable
+  public TableTaskConfig getTaskConfig() {
+    return _taskConfig;
+  }
+
+  public void setTaskConfig(TableTaskConfig taskConfig) {
+    _taskConfig = taskConfig;
+  }
+
+  @JsonProperty(ROUTING_CONFIG_KEY)
+  @Nullable
+  public RoutingConfig getRoutingConfig() {
+    return _routingConfig;
+  }
+
+  public void setRoutingConfig(RoutingConfig routingConfig) {
+    _routingConfig = routingConfig;
+  }
+
+  @JsonProperty(QUERY_CONFIG_KEY)
+  @Nullable
+  public QueryConfig getQueryConfig() {
+    return _queryConfig;
+  }
+
+  public void setQueryConfig(QueryConfig queryConfig) {
+    _queryConfig = queryConfig;
+  }
+
+  @JsonProperty(INSTANCE_ASSIGNMENT_CONFIG_MAP_KEY)
+  @Nullable
+  public Map<String, InstanceAssignmentConfig> getInstanceAssignmentConfigMap() {
+    return _instanceAssignmentConfigMap;
+  }
+
+  public void setInstanceAssignmentConfigMap(Map<String, InstanceAssignmentConfig> instanceAssignmentConfigMap) {
+    _instanceAssignmentConfigMap = instanceAssignmentConfigMap;
+  }
+
+  @JsonProperty(INSTANCE_PARTITIONS_MAP_CONFIG_KEY)
+  @Nullable
+  public Map<InstancePartitionsType, String> getInstancePartitionsMap() {
+    return _instancePartitionsMap;
+  }
+
+  public void setInstancePartitionsMap(Map<InstancePartitionsType, String> instancePartitionsMap) {
+    _instancePartitionsMap = instancePartitionsMap;
+  }
+
+  @JsonProperty(FIELD_CONFIG_LIST_KEY)
+  @Nullable
+  public List<FieldConfig> getFieldConfigList() {
+    return _fieldConfigList;
+  }
+
+  public void setFieldConfigList(List<FieldConfig> fieldConfigList) {
+    _fieldConfigList = fieldConfigList;
+  }
+
+  @Nullable
+  public UpsertConfig getUpsertConfig() {
+    return _upsertConfig;
+  }
+
+  public void setUpsertConfig(UpsertConfig upsertConfig) {
+    _upsertConfig = upsertConfig;
+  }
+
+  @JsonIgnore
+  public boolean isUpsertEnabled() {
+    return _upsertConfig != null && _upsertConfig.getMode() != UpsertConfig.Mode.NONE;
+  }
+
+  @Nullable
+  public DedupConfig getDedupConfig() {
+    return _dedupConfig;
+  }
+
+  public void setDedupConfig(DedupConfig dedupConfig) {
+    _dedupConfig = dedupConfig;
+  }
+
+  @JsonIgnore
+  public boolean isDedupEnabled() {
+    return _dedupConfig != null && _dedupConfig.isDedupEnabled();
+  }
+
+  @Nullable
+  public DimensionTableConfig getDimensionTableConfig() {
+    return _dimensionTableConfig;
+  }
+
+  public void setDimensionTableConfig(DimensionTableConfig dimensionTableConfig) {
+    _dimensionTableConfig = dimensionTableConfig;
+  }
+
+  @JsonProperty(INGESTION_CONFIG_KEY)
+  @Nullable
+  public IngestionConfig getIngestionConfig() {
+    return _ingestionConfig;
+  }
+
+  public void setIngestionConfig(IngestionConfig ingestionConfig) {
+    _ingestionConfig = ingestionConfig;
+  }
+
+  @JsonProperty(TIER_CONFIGS_LIST_KEY)
+  @Nullable
+  public List<TierConfig> getTierConfigsList() {
+    return _tierConfigsList;
+  }
+
+  public void setTierConfigsList(List<TierConfig> tierConfigsList) {
+    _tierConfigsList = tierConfigsList;
+  }
+
+  @Deprecated
+  @JsonIgnore
+  public UpsertConfig.Mode getUpsertMode() {
+    return _upsertConfig == null ? UpsertConfig.Mode.NONE : _upsertConfig.getMode();
+  }
+
+  @JsonProperty(TUNER_CONFIG_LIST_KEY)
+  public List<TunerConfig> getTunerConfigsList() {
+    return _tunerConfigList;
+  }
+
+  public void setTunerConfigsList(List<TunerConfig> tunerConfigList) {
+    _tunerConfigList = tunerConfigList;
+  }
+
+  @JsonProperty(SEGMENT_ASSIGNMENT_CONFIG_MAP_KEY)
+  @Nullable
+  public Map<String, SegmentAssignmentConfig> getSegmentAssignmentConfigMap() {
+    return _segmentAssignmentConfigMap;
+  }
+
+  public void setSegmentAssignmentConfigMap(Map<String, SegmentAssignmentConfig> segmentAssignmentConfigMap) {
+    _segmentAssignmentConfigMap = segmentAssignmentConfigMap;
+  }
+
+  @JsonIgnore
+  public int getReplication() {
+    if (_tableType == TableType.REALTIME) {
+      // Use replicasPerPartition for real-time table if exists
+      String replicasPerPartition = _validationConfig.getReplicasPerPartition();
+      if (replicasPerPartition != null) {
+        return Integer.parseInt(replicasPerPartition);
+      }
+    }
+    return Integer.parseInt(_validationConfig.getReplication());
+  }
+
+  @JsonProperty(PAGE_CACHE_WARMUP_CONFIG_KEY)
+  @Nullable
+  public PageCacheWarmupConfig getPageCacheWarmupConfig() {
+    return _pageCacheWarmupConfig;
+  }
+
+  public void setPageCacheWarmupConfig(PageCacheWarmupConfig pageCacheWarmupConfig) {
+    _pageCacheWarmupConfig = pageCacheWarmupConfig;
+  }
+}

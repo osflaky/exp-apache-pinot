@@ -1,0 +1,99 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pinot.common.metrics;
+
+import org.apache.pinot.common.Utils;
+
+
+/// Enumeration containing all the timers exposed by the Pinot broker.
+public enum BrokerTimer implements AbstractMetrics.Timer {
+  ROUTING_TABLE_UPDATE_TIME(true),
+  CLUSTER_CHANGE_QUEUE_TIME(true), // metric tracking the freshness lag for consuming segments
+  FRESHNESS_LAG_MS(false),
+  QUERY_TOTAL_TIME_MS(true),
+  MULTI_STAGE_QUERY_TOTAL_TIME_MS(true),
+
+  SECONDARY_WORKLOAD_QUERY_TOTAL_TIME_MS(true),
+
+  // The latency of sending the request from broker to server
+  NETTY_CONNECTION_SEND_REQUEST_LATENCY(false),
+
+  // aggregated thread cpu time in nanoseconds for query processing from offline servers
+  OFFLINE_THREAD_CPU_TIME_NS(false),
+  // aggregated thread cpu time in nanoseconds for query processing from realtime servers
+  REALTIME_THREAD_CPU_TIME_NS(false),
+  // aggregated system activities cpu time in nanoseconds for query processing from offline servers
+  OFFLINE_SYSTEM_ACTIVITIES_CPU_TIME_NS(false),
+  // aggregated system activities cpu time in nanoseconds for query processing from realtime servers
+  REALTIME_SYSTEM_ACTIVITIES_CPU_TIME_NS(false),
+  // aggregated response serialization cpu time in nanoseconds for query processing from offline servers
+  OFFLINE_RESPONSE_SER_CPU_TIME_NS(false),
+  // aggregated response serialization cpu time in nanoseconds for query processing from realtime servers
+  REALTIME_RESPONSE_SER_CPU_TIME_NS(false),
+  // aggregated total cpu time(thread + system activities + response serialization) in nanoseconds for query
+  // processing from offline servers
+  OFFLINE_TOTAL_CPU_TIME_NS(false),
+  // aggregated total cpu time(thread + system activities + response serialization) in nanoseconds for query
+  // processing from realtime servers
+  REALTIME_TOTAL_CPU_TIME_NS(false),
+  // How long it took the server to start.
+  STARTUP_SUCCESS_DURATION_MS(true),
+  // Wall-clock duration of startup warmup, from the moment it begins (Helix convergence) to the moment
+  // readiness is released. Distinguishes "warmed to the floor" from "hit the budget ceiling".
+  STARTUP_WARMUP_DURATION_MS(true),
+  // How long the startup server pre-connect (open broker->server channels, including TLS handshake)
+  // took, from Helix convergence to the last channel connecting or the budget expiring.
+  STARTUP_PRECONNECT_DURATION_MS(true),
+  // Time to establish a single broker->server Netty channel (TCP connect, plus the TLS handshake on the
+  // startup pre-connect path). Complements the NETTY_CONNECTION_CONNECT_TIME_MS gauge, which only keeps
+  // the last value, by keeping a burst of connections on a cold broker analyzable across the whole
+  // distribution. NOTE: must not be named after that gauge -- both derive their metric name from the
+  // enum constant, and a gauge and a timer sharing one name collide in the metrics registry.
+  NETTY_CONNECTION_CONNECT_LATENCY_MS(true),
+  // GRPC query execution time
+  GRPC_QUERY_EXECUTION_MS(true),
+  // Audit logging timers
+  AUDIT_REQUEST_PROCESSING_TIME(true),
+  AUDIT_RESPONSE_PROCESSING_TIME(true),
+  // The total time spent in processing the workload queries
+  WORKLOAD_TOTAL_QUERY_TIME_MS(false),
+  // Time taken for remote cluster broker to compute routing table
+  REMOTE_CLUSTER_BROKER_ROUTING_CALCULATION_TIME_MS(true);
+
+  private final String _timerName;
+  private final boolean _global;
+
+  BrokerTimer(boolean global) {
+    _global = global;
+    _timerName = Utils.toCamelCase(name().toLowerCase());
+  }
+
+  @Override
+  public String getTimerName() {
+    return _timerName;
+  }
+
+  /// Returns true if the timer is global (not attached to a particular resource)
+  ///
+  /// @return true if the timer is global
+  @Override
+  public boolean isGlobal() {
+    return _global;
+  }
+}

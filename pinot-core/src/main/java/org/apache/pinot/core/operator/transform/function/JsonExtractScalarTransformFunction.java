@@ -1,0 +1,902 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pinot.core.operator.transform.function;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.common.annotations.VisibleForTesting;
+import com.jayway.jsonpath.Configuration;
+import com.jayway.jsonpath.JsonPath;
+import com.jayway.jsonpath.Option;
+import com.jayway.jsonpath.ParseContext;
+import com.jayway.jsonpath.spi.json.JacksonJsonProvider;
+import com.jayway.jsonpath.spi.mapper.JacksonMappingProvider;
+import java.math.BigDecimal;
+import java.util.List;
+import java.util.Map;
+import java.util.function.IntFunction;
+import javax.annotation.Nullable;
+import org.apache.pinot.common.function.FastJsonPathExtractor;
+import org.apache.pinot.common.function.ForyJsonPathExtractor;
+import org.apache.pinot.common.function.JsonPathCache;
+import org.apache.pinot.common.function.SimpleJsonPath;
+import org.apache.pinot.core.operator.ColumnContext;
+import org.apache.pinot.core.operator.blocks.ValueBlock;
+import org.apache.pinot.core.operator.transform.TransformResultMetadata;
+import org.apache.pinot.core.util.NumberUtils;
+import org.apache.pinot.core.util.NumericException;
+import org.apache.pinot.spi.data.FieldSpec.DataType;
+import org.apache.pinot.spi.utils.BooleanUtils;
+import org.apache.pinot.spi.utils.JsonUtils;
+import org.apache.pinot.spi.utils.PinotDataType;
+import org.apache.pinot.spi.utils.TimestampUtils;
+import org.roaringbitmap.RoaringBitmap;
+
+
+/// Implements the typed JSON extraction transforms:
+///
+/// | Function | Simple-path behavior |
+/// | --- | --- |
+/// | `jsonExtractScalar` | Builds the existing Jayway DOM; unchanged for backward compatibility. |
+/// | `jsonExtractScalarFast` | Uses [FastJsonPathExtractor] and scans the full root value, preserving Jayway results. |
+/// | `jsonExtractScalarFirstMatch` | Uses [FastJsonPathExtractor] and stops when the addressed value is found. |
+/// | `jsonExtractScalarFory` | Experimental Fory streaming extraction with per-row Jayway fallback. |
+///
+/// Each function reads a JSON document from `jsonField` for each row, resolves the
+/// [Stefan Goessner JsonPath](https://goessner.net/articles/JsonPath/) expression against it, and
+/// converts the resolved value to `resultsType`.
+///
+/// ```sql
+/// SELECT jsonExtractScalarFast(payload, '$.user.id', 'LONG', '-1'),
+///        jsonExtractScalarFirstMatch(payload, '$.service.name', 'STRING', 'unknown')
+/// FROM events
+/// ```
+///
+/// The fast variants optimize simple linear paths (`$` followed by `.key`, `['key']`, or `[index]`) and fall back
+/// to the existing Jayway implementation for complex paths, unsupported input roots, and any fast-extractor
+/// exception. `FirstMatch` is faster for fields near the start of a document, but deliberately resolves duplicate
+/// keys to the first non-null occurrence and does not validate malformed content after the resolved value. Use it
+/// only for well-formed, duplicate-free JSON. `Fast` scans the full root value and retains Jayway's last-key-wins
+/// and malformed-document behavior; see [FastJsonPathExtractor] for one documented unaddressed-value edge case.
+/// `jsonExtractScalarFory` is experimental and must be selected explicitly. It accelerates simple paths over
+/// `STRING` input for scalar result types other than `STRING`, `JSON`, and `BIG_DECIMAL`. `BYTES` input, complex
+/// paths, containers / array result types, precision-sensitive results, documents beyond Jackson's configured
+/// limits, and Fory failures use Jayway. Its name, supported envelope, and implementation can change while the
+/// integration is evaluated. Fory is an optional runtime dependency; add `org.apache.fory:fory-json:1.6.0` (and its
+/// transitive `fory-core` dependency) to the application classpath to activate this experimental path.
+///
+/// **Arguments:**
+/// - `jsonField` — single-value `STRING` or `BYTES` column / transform expression containing JSON.
+/// - `jsonPath` — JsonPath expression used to read the value.
+/// - `resultsType` — Pinot data type for the output. Append `_ARRAY` for multi-value results.
+/// - `defaultValue` (optional) — used when the path resolves to `null` or fails. Without it, unresolved
+///   SV rows throw `IllegalArgumentException`; MV rows surface as empty arrays, but null elements within
+///   a resolved array still throw.
+///
+/// **Supported `resultsType`:** `INT`, `LONG`, `FLOAT`, `DOUBLE`, `BIG_DECIMAL`, `BOOLEAN`, `TIMESTAMP`,
+/// `STRING`, `JSON`, `BYTES`, plus `_ARRAY` variants of `INT` / `LONG` / `FLOAT` / `DOUBLE` /
+/// `BIG_DECIMAL` / `BOOLEAN` / `TIMESTAMP` / `STRING`.
+///
+/// Multi-stage planning accepts all of these result types, but currently lowers `BIG_DECIMAL_ARRAY` to
+/// `DOUBLE_ARRAY`. Use the single-stage engine when decimal-array precision must be preserved.
+///
+/// **Per-row coercion** of the JsonPath result to `resultsType`:
+/// - `BOOLEAN` (stored as `INT`) follows Pinot's numeric convention — any non-zero `Number` is true;
+///   `Boolean` and `"true"` / `"TRUE"` / `"1"` strings (via [BooleanUtils#toInt(String)]) are also true.
+/// - `TIMESTAMP` (stored as `LONG`) accepts numeric epoch millis directly; strings go through
+///   [TimestampUtils#toMillisSinceEpoch] (ISO-8601 and numeric millis strings).
+/// - `STRING` returns `String` values as-is; other JSON values are serialized via
+///   [JsonUtils#objectToString].
+/// - `BYTES` decodes a Base64-encoded JSON string, matching [PinotDataType#JSON].
+/// - `BIG_DECIMAL` and `STRING` paths use a BigDecimal-preserving JSON parser
+///   (`JSON_PARSER_CONTEXT_WITH_BIG_DECIMAL`) to avoid precision loss on numeric values; other paths use
+///   the default parser.
+/// - Other types coerce via `Number` cast (preserved as the canonical primitive form) or
+///   `parse*(toString())`.
+public class JsonExtractScalarTransformFunction extends BaseTransformFunction {
+  public static final String FUNCTION_NAME = "jsonExtractScalar";
+  public static final String FAST_FUNCTION_NAME = "jsonExtractScalarFast";
+  public static final String FIRST_MATCH_FUNCTION_NAME = "jsonExtractScalarFirstMatch";
+  public static final String FORY_FUNCTION_NAME = "jsonExtractScalarFory";
+
+  private enum ExtractionMode {
+    JAYWAY,
+    FAST,
+    FIRST_MATCH,
+    FORY
+  }
+
+  // This ObjectMapper requires special configurations, hence we can't use pinot JsonUtils here.
+  private static final ObjectMapper OBJECT_MAPPER_WITH_BIG_DECIMAL =
+      new ObjectMapper().configure(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS, true);
+
+  private static final ParseContext JSON_PARSER_CONTEXT_WITH_BIG_DECIMAL = JsonPath.using(
+      new Configuration.ConfigurationBuilder().jsonProvider(new JacksonJsonProvider(OBJECT_MAPPER_WITH_BIG_DECIMAL))
+          .mappingProvider(new JacksonMappingProvider()).options(Option.SUPPRESS_EXCEPTIONS).build());
+
+  private static final ParseContext JSON_PARSER_CONTEXT = JsonPath.using(
+      new Configuration.ConfigurationBuilder().jsonProvider(new JacksonJsonProvider())
+          .mappingProvider(new JacksonMappingProvider()).options(Option.SUPPRESS_EXCEPTIONS).build());
+
+  private final String _functionName;
+  private final ExtractionMode _extractionMode;
+  private TransformFunction _jsonFieldTransformFunction;
+  private JsonPath _jsonPath;
+  @Nullable
+  private SimpleJsonPath _simpleJsonPath;
+  private DataType _dataType;
+  private DataType _storedType;
+  private Object _defaultValue;
+  private boolean _defaultIsNull;
+  private boolean _foryEligible;
+  private TransformResultMetadata _resultMetadata;
+
+  public JsonExtractScalarTransformFunction() {
+    this(FUNCTION_NAME, ExtractionMode.JAYWAY);
+  }
+
+  private JsonExtractScalarTransformFunction(String functionName, ExtractionMode extractionMode) {
+    _functionName = functionName;
+    _extractionMode = extractionMode;
+  }
+
+  /// Full-scan fast variant of [JsonExtractScalarTransformFunction].
+  public static final class Fast extends JsonExtractScalarTransformFunction {
+    public Fast() {
+      super(FAST_FUNCTION_NAME, ExtractionMode.FAST);
+    }
+  }
+
+  /// First-match fast variant of [JsonExtractScalarTransformFunction].
+  public static final class FirstMatch extends JsonExtractScalarTransformFunction {
+    public FirstMatch() {
+      super(FIRST_MATCH_FUNCTION_NAME, ExtractionMode.FIRST_MATCH);
+    }
+  }
+
+  /// Experimental Fory-backed variant of [JsonExtractScalarTransformFunction].
+  public static final class Fory extends JsonExtractScalarTransformFunction {
+    public Fory() {
+      super(FORY_FUNCTION_NAME, ExtractionMode.FORY);
+    }
+  }
+
+  @Override
+  public String getName() {
+    return _functionName;
+  }
+
+  @Override
+  public void init(List<TransformFunction> arguments, Map<String, ColumnContext> columnContextMap,
+      boolean nullHandlingEnabled) {
+    super.init(arguments, columnContextMap, nullHandlingEnabled);
+    // Check that there are exactly 3 or 4 arguments
+    if (arguments.size() < 3 || arguments.size() > 4) {
+      throw new IllegalArgumentException(
+          "Expected 3/4 arguments for transform function: " + _functionName
+              + "(jsonFieldName, 'jsonPath', 'resultsType', ['defaultValue'])");
+    }
+
+    TransformFunction firstArgument = arguments.get(0);
+    if (firstArgument instanceof LiteralTransformFunction || !firstArgument.getResultMetadata().isSingleValue()) {
+      throw new IllegalArgumentException(
+          "The first argument of " + _functionName
+              + " transform function must be a single-valued column or a transform function");
+    }
+    _jsonFieldTransformFunction = firstArgument;
+    String jsonPathString = ((LiteralTransformFunction) arguments.get(1)).getStringLiteral();
+    _jsonPath = JsonPathCache.INSTANCE.getOrCompute(jsonPathString);
+    _simpleJsonPath = _extractionMode == ExtractionMode.JAYWAY ? null : SimpleJsonPath.compile(jsonPathString);
+    String resultsType = ((LiteralTransformFunction) arguments.get(2)).getStringLiteral().toUpperCase();
+    boolean isSingleValue = !resultsType.endsWith("_ARRAY");
+    try {
+      _dataType = DataType.valueOf(isSingleValue ? resultsType : resultsType.substring(0, resultsType.length() - 6));
+    } catch (Exception e) {
+      throw new IllegalArgumentException(String.format(
+          "Unsupported results type: %s for %s function. Supported types are: "
+              + "INT/LONG/FLOAT/DOUBLE/BIG_DECIMAL/BOOLEAN/TIMESTAMP/STRING/JSON/BYTES/"
+              + "INT_ARRAY/LONG_ARRAY/FLOAT_ARRAY/DOUBLE_ARRAY/BIG_DECIMAL_ARRAY/BOOLEAN_ARRAY/TIMESTAMP_ARRAY/"
+              + "STRING_ARRAY", resultsType, _functionName));
+    }
+    _storedType = _dataType.getStoredType();
+    if (arguments.size() == 4) {
+      LiteralTransformFunction literalTransformFun = (LiteralTransformFunction) arguments.get(3);
+      _defaultIsNull = literalTransformFun.isNull() && _nullHandlingEnabled;
+      switch (_dataType) {
+        case INT:
+          _defaultValue = literalTransformFun.getIntLiteral();
+          break;
+        case LONG:
+          _defaultValue = literalTransformFun.getLongLiteral();
+          break;
+        case FLOAT:
+          _defaultValue = literalTransformFun.getFloatLiteral();
+          break;
+        case DOUBLE:
+          _defaultValue = literalTransformFun.getDoubleLiteral();
+          break;
+        case BIG_DECIMAL:
+          _defaultValue = literalTransformFun.getBigDecimalLiteral();
+          break;
+        case BOOLEAN:
+          // Stored as Integer 0 / 1 to match BOOLEAN's storedType (INT) so per-row consumers can
+          // unbox directly without a Boolean → Integer conversion.
+          _defaultValue = literalTransformFun.getBooleanLiteral() ? 1 : 0;
+          break;
+        case TIMESTAMP:
+          // Use long literal so numeric millis stay exact and string timestamps use LiteralContext parsing.
+          _defaultValue = literalTransformFun.getLongLiteral();
+          break;
+        case STRING:
+        case JSON:
+          _defaultValue = literalTransformFun.getStringLiteral();
+          break;
+        case BYTES:
+          _defaultValue = literalTransformFun.getBytesLiteral();
+          break;
+        default:
+          throw new IllegalArgumentException(
+              "Unsupported results type: " + _dataType + " for " + _functionName
+                  + " function. Supported types are: "
+                  + "INT/LONG/FLOAT/DOUBLE/BIG_DECIMAL/BOOLEAN/TIMESTAMP/STRING/JSON/BYTES"
+          );
+      }
+    }
+    _resultMetadata = new TransformResultMetadata(_dataType, isSingleValue, false);
+    DataType inputDataType = firstArgument.getResultMetadata().getDataType();
+    // STRING/JSON use the BigDecimal-preserving parser because non-string JSON values are serialized to the output.
+    // Fory 1.6 materializes fractional numbers as Double, so enabling it here would lose numeric precision.
+    _foryEligible = _extractionMode == ExtractionMode.FORY && _simpleJsonPath != null
+        && inputDataType == DataType.STRING && isSingleValue && _dataType != DataType.STRING
+        && _dataType != DataType.JSON && _dataType != DataType.BIG_DECIMAL;
+  }
+
+  @VisibleForTesting
+  boolean isForyEligible() {
+    return _foryEligible;
+  }
+
+  @Override
+  public TransformResultMetadata getResultMetadata() {
+    return _resultMetadata;
+  }
+
+  @Override
+  @Nullable
+  public RoaringBitmap getNullBitmap(ValueBlock valueBlock) {
+    if (!_defaultIsNull) {
+      return super.getNullBitmap(valueBlock);
+    }
+    RoaringBitmap bitmap = new RoaringBitmap();
+    for (TransformFunction arg : _arguments.subList(1, _arguments.size() - 1)) {
+      RoaringBitmap argBitmap = arg.getNullBitmap(valueBlock);
+      if (argBitmap != null) {
+        bitmap.or(argBitmap);
+      }
+    }
+    int numDocs = valueBlock.getNumDocs();
+    RoaringBitmap nullBitmap = new RoaringBitmap();
+    IntFunction<Object> resultExtractor = getResultExtractor(valueBlock);
+    for (int i = 0; i < numDocs; i++) {
+      Object result = null;
+      try {
+        result = resultExtractor.apply(i);
+      } catch (Exception ignored) {
+      }
+      if (result == null) {
+        nullBitmap.add(i);
+      }
+    }
+    if (!nullBitmap.isEmpty()) {
+      bitmap.or(nullBitmap);
+    }
+    if (bitmap.isEmpty()) {
+      return null;
+    }
+    return bitmap;
+  }
+
+  @Override
+  public int[] transformToIntValuesSV(ValueBlock valueBlock) {
+    if (_storedType != DataType.INT) {
+      return super.transformToIntValuesSV(valueBlock);
+    }
+    initIntValuesSV(valueBlock.getNumDocs());
+    IntFunction<Object> resultExtractor = getResultExtractor(valueBlock);
+    int defaultValue = _defaultValue != null ? (Integer) _defaultValue : 0;
+    boolean isBoolean = _dataType == DataType.BOOLEAN;
+    int numDocs = valueBlock.getNumDocs();
+    for (int i = 0; i < numDocs; i++) {
+      Object result = null;
+      try {
+        result = resultExtractor.apply(i);
+      } catch (Exception ignored) {
+      }
+      if (result == null) {
+        if (_defaultValue != null) {
+          _intValuesSV[i] = defaultValue;
+          continue;
+        }
+        throw new IllegalArgumentException(
+            "Cannot resolve JSON path on some records. Consider setting a default value.");
+      }
+      _intValuesSV[i] = toInt(result, isBoolean);
+    }
+    return _intValuesSV;
+  }
+
+  @Override
+  public long[] transformToLongValuesSV(ValueBlock valueBlock) {
+    if (_storedType != DataType.LONG) {
+      return super.transformToLongValuesSV(valueBlock);
+    }
+    initLongValuesSV(valueBlock.getNumDocs());
+    IntFunction<Object> resultExtractor = getResultExtractor(valueBlock);
+    long defaultValue = _defaultValue != null ? (Long) _defaultValue : 0L;
+    boolean isTimestamp = _dataType == DataType.TIMESTAMP;
+    int numDocs = valueBlock.getNumDocs();
+    for (int i = 0; i < numDocs; i++) {
+      Object result = null;
+      try {
+        result = resultExtractor.apply(i);
+      } catch (Exception ignored) {
+      }
+      if (result == null) {
+        if (_defaultValue != null) {
+          _longValuesSV[i] = defaultValue;
+          continue;
+        }
+        throw new IllegalArgumentException(
+            "Cannot resolve JSON path on some records. Consider setting a default value.");
+      }
+      _longValuesSV[i] = toLong(result, isTimestamp);
+    }
+    return _longValuesSV;
+  }
+
+  @Override
+  public float[] transformToFloatValuesSV(ValueBlock valueBlock) {
+    if (_storedType != DataType.FLOAT) {
+      return super.transformToFloatValuesSV(valueBlock);
+    }
+    initFloatValuesSV(valueBlock.getNumDocs());
+    IntFunction<Object> resultExtractor = getResultExtractor(valueBlock);
+    float defaultValue = _defaultValue != null ? (Float) _defaultValue : 0f;
+    int numDocs = valueBlock.getNumDocs();
+    for (int i = 0; i < numDocs; i++) {
+      Object result = null;
+      try {
+        result = resultExtractor.apply(i);
+      } catch (Exception ignored) {
+      }
+      if (result == null) {
+        if (_defaultValue != null) {
+          _floatValuesSV[i] = defaultValue;
+          continue;
+        }
+        throw new IllegalArgumentException(
+            "Cannot resolve JSON path on some records. Consider setting a default value.");
+      }
+      _floatValuesSV[i] = toFloat(result);
+    }
+    return _floatValuesSV;
+  }
+
+  @Override
+  public double[] transformToDoubleValuesSV(ValueBlock valueBlock) {
+    if (_storedType != DataType.DOUBLE) {
+      return super.transformToDoubleValuesSV(valueBlock);
+    }
+    initDoubleValuesSV(valueBlock.getNumDocs());
+    IntFunction<Object> resultExtractor = getResultExtractor(valueBlock);
+    double defaultValue = _defaultValue != null ? (Double) _defaultValue : 0d;
+    int numDocs = valueBlock.getNumDocs();
+    for (int i = 0; i < numDocs; i++) {
+      Object result = null;
+      try {
+        result = resultExtractor.apply(i);
+      } catch (Exception ignored) {
+      }
+      if (result == null) {
+        if (_defaultValue != null) {
+          _doubleValuesSV[i] = defaultValue;
+          continue;
+        }
+        throw new IllegalArgumentException(
+            "Cannot resolve JSON path on some records. Consider setting a default value.");
+      }
+      _doubleValuesSV[i] = toDouble(result);
+    }
+    return _doubleValuesSV;
+  }
+
+  @Override
+  public BigDecimal[] transformToBigDecimalValuesSV(ValueBlock valueBlock) {
+    if (_storedType != DataType.BIG_DECIMAL) {
+      return super.transformToBigDecimalValuesSV(valueBlock);
+    }
+    initBigDecimalValuesSV(valueBlock.getNumDocs());
+    IntFunction<Object> resultExtractor = getResultExtractorWithBigDecimal(valueBlock);
+    BigDecimal defaultValue = (BigDecimal) _defaultValue;
+    int numDocs = valueBlock.getNumDocs();
+    for (int i = 0; i < numDocs; i++) {
+      Object result = null;
+      try {
+        result = resultExtractor.apply(i);
+      } catch (Exception ignored) {
+      }
+      if (result == null) {
+        if (_defaultValue != null) {
+          _bigDecimalValuesSV[i] = defaultValue;
+          continue;
+        }
+        throw new IllegalArgumentException(
+            "Cannot resolve JSON path on some records. Consider setting a default value.");
+      }
+      _bigDecimalValuesSV[i] = toBigDecimal(result);
+    }
+    return _bigDecimalValuesSV;
+  }
+
+  @Override
+  public String[] transformToStringValuesSV(ValueBlock valueBlock) {
+    if (_storedType != DataType.STRING) {
+      return super.transformToStringValuesSV(valueBlock);
+    }
+    initStringValuesSV(valueBlock.getNumDocs());
+    IntFunction<Object> resultExtractor = getResultExtractorWithBigDecimal(valueBlock);
+    String defaultValue = (String) _defaultValue;
+    int numDocs = valueBlock.getNumDocs();
+    for (int i = 0; i < numDocs; i++) {
+      Object result = null;
+      try {
+        result = resultExtractor.apply(i);
+      } catch (Exception ignored) {
+      }
+      if (result == null) {
+        if (_defaultValue != null) {
+          _stringValuesSV[i] = defaultValue;
+          continue;
+        }
+        throw new IllegalArgumentException(
+            "Cannot resolve JSON path on some records. Consider setting a default value.");
+      }
+      _stringValuesSV[i] = toString(result);
+    }
+    return _stringValuesSV;
+  }
+
+  @Override
+  public byte[][] transformToBytesValuesSV(ValueBlock valueBlock) {
+    if (_storedType != DataType.BYTES) {
+      return super.transformToBytesValuesSV(valueBlock);
+    }
+    initBytesValuesSV(valueBlock.getNumDocs());
+    IntFunction<Object> resultExtractor = getResultExtractor(valueBlock);
+    byte[] defaultValue = (byte[]) _defaultValue;
+    int numDocs = valueBlock.getNumDocs();
+    for (int i = 0; i < numDocs; i++) {
+      Object result = null;
+      try {
+        result = resultExtractor.apply(i);
+      } catch (Exception ignored) {
+      }
+      if (result == null) {
+        if (_defaultValue != null) {
+          _bytesValuesSV[i] = defaultValue;
+          continue;
+        }
+        throw new IllegalArgumentException(
+            "Cannot resolve JSON path on some records. Consider setting a default value.");
+      }
+      _bytesValuesSV[i] = PinotDataType.JSON.toBytes(result);
+    }
+    return _bytesValuesSV;
+  }
+
+  @Override
+  public int[][] transformToIntValuesMV(ValueBlock valueBlock) {
+    if (_storedType != DataType.INT) {
+      return super.transformToIntValuesMV(valueBlock);
+    }
+    initIntValuesMV(valueBlock.getNumDocs());
+    IntFunction<List<Object>> resultExtractor = getResultExtractor(valueBlock);
+    int defaultValue = _defaultValue != null ? (Integer) _defaultValue : 0;
+    boolean isBoolean = _dataType == DataType.BOOLEAN;
+    int numDocs = valueBlock.getNumDocs();
+    for (int i = 0; i < numDocs; i++) {
+      List<Object> result = null;
+      try {
+        result = resultExtractor.apply(i);
+      } catch (Exception ignored) {
+      }
+      if (result == null) {
+        _intValuesMV[i] = new int[0];
+        continue;
+      }
+      int numValues = result.size();
+      int[] values = new int[numValues];
+      for (int j = 0; j < numValues; j++) {
+        Object element = result.get(j);
+        if (element == null) {
+          if (_defaultValue != null) {
+            values[j] = defaultValue;
+            continue;
+          }
+          throw new IllegalArgumentException(
+              "At least one of the resolved JSON arrays include nulls, which is not supported in Pinot. "
+                  + "Consider setting a default value as the fourth argument of " + _functionName + ".");
+        }
+        values[j] = toInt(element, isBoolean);
+      }
+      _intValuesMV[i] = values;
+    }
+    return _intValuesMV;
+  }
+
+  @Override
+  public long[][] transformToLongValuesMV(ValueBlock valueBlock) {
+    if (_storedType != DataType.LONG) {
+      return super.transformToLongValuesMV(valueBlock);
+    }
+    initLongValuesMV(valueBlock.getNumDocs());
+    IntFunction<List<Object>> resultExtractor = getResultExtractor(valueBlock);
+    long defaultValue = _defaultValue != null ? (Long) _defaultValue : 0L;
+    boolean isTimestamp = _dataType == DataType.TIMESTAMP;
+    int numDocs = valueBlock.getNumDocs();
+    for (int i = 0; i < numDocs; i++) {
+      List<Object> result = null;
+      try {
+        result = resultExtractor.apply(i);
+      } catch (Exception ignored) {
+      }
+      if (result == null) {
+        _longValuesMV[i] = new long[0];
+        continue;
+      }
+      int numValues = result.size();
+      long[] values = new long[numValues];
+      for (int j = 0; j < numValues; j++) {
+        Object element = result.get(j);
+        if (element == null) {
+          if (_defaultValue != null) {
+            values[j] = defaultValue;
+            continue;
+          }
+          throw new IllegalArgumentException(
+              "At least one of the resolved JSON arrays include nulls, which is not supported in Pinot. "
+                  + "Consider setting a default value as the fourth argument of " + _functionName + ".");
+        }
+        values[j] = toLong(element, isTimestamp);
+      }
+      _longValuesMV[i] = values;
+    }
+    return _longValuesMV;
+  }
+
+  @Override
+  public float[][] transformToFloatValuesMV(ValueBlock valueBlock) {
+    if (_storedType != DataType.FLOAT) {
+      return super.transformToFloatValuesMV(valueBlock);
+    }
+    initFloatValuesMV(valueBlock.getNumDocs());
+    IntFunction<List<Object>> resultExtractor = getResultExtractor(valueBlock);
+    float defaultValue = _defaultValue != null ? (Float) _defaultValue : 0f;
+    int numDocs = valueBlock.getNumDocs();
+    for (int i = 0; i < numDocs; i++) {
+      List<Object> result = null;
+      try {
+        result = resultExtractor.apply(i);
+      } catch (Exception ignored) {
+      }
+      if (result == null) {
+        _floatValuesMV[i] = new float[0];
+        continue;
+      }
+      int numValues = result.size();
+      float[] values = new float[numValues];
+      for (int j = 0; j < numValues; j++) {
+        Object element = result.get(j);
+        if (element == null) {
+          if (_defaultValue != null) {
+            values[j] = defaultValue;
+            continue;
+          }
+          throw new IllegalArgumentException(
+              "At least one of the resolved JSON arrays include nulls, which is not supported in Pinot. "
+                  + "Consider setting a default value as the fourth argument of " + _functionName + ".");
+        }
+        values[j] = toFloat(element);
+      }
+      _floatValuesMV[i] = values;
+    }
+    return _floatValuesMV;
+  }
+
+  @Override
+  public double[][] transformToDoubleValuesMV(ValueBlock valueBlock) {
+    if (_storedType != DataType.DOUBLE) {
+      return super.transformToDoubleValuesMV(valueBlock);
+    }
+    initDoubleValuesMV(valueBlock.getNumDocs());
+    IntFunction<List<Object>> resultExtractor = getResultExtractor(valueBlock);
+    double defaultValue = _defaultValue != null ? (Double) _defaultValue : 0d;
+    int numDocs = valueBlock.getNumDocs();
+    for (int i = 0; i < numDocs; i++) {
+      List<Object> result = null;
+      try {
+        result = resultExtractor.apply(i);
+      } catch (Exception ignored) {
+      }
+      if (result == null) {
+        _doubleValuesMV[i] = new double[0];
+        continue;
+      }
+      int numValues = result.size();
+      double[] values = new double[numValues];
+      for (int j = 0; j < numValues; j++) {
+        Object element = result.get(j);
+        if (element == null) {
+          if (_defaultValue != null) {
+            values[j] = defaultValue;
+            continue;
+          }
+          throw new IllegalArgumentException(
+              "At least one of the resolved JSON arrays include nulls, which is not supported in Pinot. "
+                  + "Consider setting a default value as the fourth argument of " + _functionName + ".");
+        }
+        values[j] = toDouble(element);
+      }
+      _doubleValuesMV[i] = values;
+    }
+    return _doubleValuesMV;
+  }
+
+  @Override
+  public BigDecimal[][] transformToBigDecimalValuesMV(ValueBlock valueBlock) {
+    if (_storedType != DataType.BIG_DECIMAL) {
+      return super.transformToBigDecimalValuesMV(valueBlock);
+    }
+    initBigDecimalValuesMV(valueBlock.getNumDocs());
+    IntFunction<List<Object>> resultExtractor = getResultExtractorWithBigDecimal(valueBlock);
+    BigDecimal defaultValue = (BigDecimal) _defaultValue;
+    int numDocs = valueBlock.getNumDocs();
+    for (int i = 0; i < numDocs; i++) {
+      List<Object> result = null;
+      try {
+        result = resultExtractor.apply(i);
+      } catch (Exception ignored) {
+      }
+      if (result == null) {
+        _bigDecimalValuesMV[i] = new BigDecimal[0];
+        continue;
+      }
+      int numValues = result.size();
+      BigDecimal[] values = new BigDecimal[numValues];
+      for (int j = 0; j < numValues; j++) {
+        Object element = result.get(j);
+        if (element == null) {
+          if (_defaultValue != null) {
+            values[j] = defaultValue;
+            continue;
+          }
+          throw new IllegalArgumentException(
+              "At least one of the resolved JSON arrays include nulls, which is not supported in Pinot. "
+                  + "Consider setting a default value as the fourth argument of " + _functionName + ".");
+        }
+        values[j] = toBigDecimal(element);
+      }
+      _bigDecimalValuesMV[i] = values;
+    }
+    return _bigDecimalValuesMV;
+  }
+
+  @Override
+  public String[][] transformToStringValuesMV(ValueBlock valueBlock) {
+    if (_storedType != DataType.STRING) {
+      return super.transformToStringValuesMV(valueBlock);
+    }
+    initStringValuesMV(valueBlock.getNumDocs());
+    IntFunction<List<Object>> resultExtractor = getResultExtractorWithBigDecimal(valueBlock);
+    String defaultValue = (String) _defaultValue;
+    int numDocs = valueBlock.getNumDocs();
+    for (int i = 0; i < numDocs; i++) {
+      List<Object> result = null;
+      try {
+        result = resultExtractor.apply(i);
+      } catch (Exception ignored) {
+      }
+      if (result == null) {
+        _stringValuesMV[i] = new String[0];
+        continue;
+      }
+      int numValues = result.size();
+      String[] values = new String[numValues];
+      for (int j = 0; j < numValues; j++) {
+        Object element = result.get(j);
+        if (element == null) {
+          if (_defaultValue != null) {
+            values[j] = defaultValue;
+            continue;
+          }
+          throw new IllegalArgumentException(
+              "At least one of the resolved JSON arrays include nulls, which is not supported in Pinot. "
+                  + "Consider setting a default value as the fourth argument of " + _functionName + ".");
+        }
+        values[j] = toString(element);
+      }
+      _stringValuesMV[i] = values;
+    }
+    return _stringValuesMV;
+  }
+
+  private static int toInt(Object value, boolean isBoolean) {
+    if (isBoolean) {
+      if (value instanceof Boolean) {
+        return (Boolean) value ? 1 : 0;
+      }
+      // For BOOLEAN result, follow PinotDataType numeric convention: non-zero number → true.
+      if (value instanceof Number) {
+        return ((Number) value).doubleValue() != 0 ? 1 : 0;
+      }
+      // String fallback: BooleanUtils.toInt accepts "true" / "TRUE" / "1".
+      return BooleanUtils.toInt(value.toString());
+    }
+    if (value instanceof Number) {
+      return ((Number) value).intValue();
+    }
+    if (value instanceof Boolean) {
+      return (Boolean) value ? 1 : 0;
+    }
+    return Integer.parseInt(value.toString());
+  }
+
+  private static long toLong(Object value, boolean isTimestamp) {
+    if (value instanceof Number) {
+      return ((Number) value).longValue();
+    }
+    if (isTimestamp) {
+      return TimestampUtils.toMillisSinceEpoch(value.toString());
+    }
+    if (value instanceof Boolean) {
+      return (Boolean) value ? 1L : 0L;
+    }
+    try {
+      return NumberUtils.parseJsonLong(value.toString());
+    } catch (NumericException nfe) {
+      throw new NumberFormatException("For input string: \"" + value + "\"");
+    }
+  }
+
+  private static float toFloat(Object value) {
+    if (value instanceof Number) {
+      return ((Number) value).floatValue();
+    }
+    if (value instanceof Boolean) {
+      return (Boolean) value ? 1f : 0f;
+    }
+    return Float.parseFloat(value.toString());
+  }
+
+  private static double toDouble(Object value) {
+    if (value instanceof Number) {
+      return ((Number) value).doubleValue();
+    }
+    if (value instanceof Boolean) {
+      return (Boolean) value ? 1d : 0d;
+    }
+    return Double.parseDouble(value.toString());
+  }
+
+  private static BigDecimal toBigDecimal(Object value) {
+    if (value instanceof BigDecimal) {
+      return (BigDecimal) value;
+    }
+    if (value instanceof Boolean) {
+      return (Boolean) value ? BigDecimal.ONE : BigDecimal.ZERO;
+    }
+    return new BigDecimal(value.toString());
+  }
+
+  private static String toString(Object value) {
+    if (value instanceof String) {
+      return (String) value;
+    }
+    try {
+      return JsonUtils.objectToString(value);
+    } catch (JsonProcessingException e) {
+      throw new RuntimeException("Caught exception while serializing JSON value: " + value, e);
+    }
+  }
+
+  @SuppressWarnings("unchecked")
+  private <T> IntFunction<T> getResultExtractor(ValueBlock valueBlock, ParseContext parseContext,
+      boolean useBigDecimal) {
+    if (_jsonFieldTransformFunction.getResultMetadata().getDataType() == DataType.BYTES) {
+      byte[][] jsonBytes = _jsonFieldTransformFunction.transformToBytesValuesSV(valueBlock);
+      IntFunction<T> jaywayExtractor = i -> parseContext.parseUtf8(jsonBytes[i]).read(_jsonPath);
+      if (_simpleJsonPath == null || _extractionMode == ExtractionMode.FORY) {
+        return jaywayExtractor;
+      }
+      SimpleJsonPath[] paths = {_simpleJsonPath};
+      Object[] result = new Object[1];
+      boolean earlyExit = _extractionMode == ExtractionMode.FIRST_MATCH;
+      return i -> {
+        if (FastJsonPathExtractor.canExtract(jsonBytes[i])) {
+          try {
+            FastJsonPathExtractor.extract(jsonBytes[i], paths, result, useBigDecimal, earlyExit);
+            return (T) result[0];
+          } catch (Exception ignored) {
+            // Retry with Jayway so a fast-extractor failure cannot change the existing result.
+          }
+        }
+        return jaywayExtractor.apply(i);
+      };
+    } else {
+      String[] jsonStrings = _jsonFieldTransformFunction.transformToStringValuesSV(valueBlock);
+      IntFunction<T> jaywayExtractor = i -> parseContext.parse(jsonStrings[i]).read(_jsonPath);
+      if (_simpleJsonPath == null) {
+        return jaywayExtractor;
+      }
+      if (_extractionMode == ExtractionMode.FORY) {
+        if (!_foryEligible || useBigDecimal) {
+          return jaywayExtractor;
+        }
+        try {
+          if (!ForyJsonPathExtractor.isAvailable()) {
+            return jaywayExtractor;
+          }
+        } catch (LinkageError ignored) {
+          return jaywayExtractor;
+        }
+        return i -> {
+          try {
+            Object value = ForyJsonPathExtractor.extract(jsonStrings[i], _simpleJsonPath);
+            return ForyJsonPathExtractor.isFallbackRequired(value) ? jaywayExtractor.apply(i) : (T) value;
+          } catch (RuntimeException | LinkageError ignored) {
+            return jaywayExtractor.apply(i);
+          }
+        };
+      }
+      SimpleJsonPath[] paths = {_simpleJsonPath};
+      Object[] result = new Object[1];
+      boolean earlyExit = _extractionMode == ExtractionMode.FIRST_MATCH;
+      return i -> {
+        if (FastJsonPathExtractor.canExtract(jsonStrings[i])) {
+          try {
+            FastJsonPathExtractor.extract(jsonStrings[i], paths, result, useBigDecimal, earlyExit);
+            return (T) result[0];
+          } catch (Exception ignored) {
+            // Retry with Jayway so a fast-extractor failure cannot change the existing result.
+          }
+        }
+        return jaywayExtractor.apply(i);
+      };
+    }
+  }
+
+  private <T> IntFunction<T> getResultExtractor(ValueBlock valueBlock) {
+    return getResultExtractor(valueBlock, JSON_PARSER_CONTEXT, false);
+  }
+
+  private <T> IntFunction<T> getResultExtractorWithBigDecimal(ValueBlock valueBlock) {
+    return getResultExtractor(valueBlock, JSON_PARSER_CONTEXT_WITH_BIG_DECIMAL, true);
+  }
+}

@@ -1,0 +1,360 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pinot.segment.local.segment.readers;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import javax.annotation.Nullable;
+import org.apache.commons.collections4.CollectionUtils;
+import org.apache.pinot.common.utils.FileUtils;
+import org.apache.pinot.segment.local.indexsegment.immutable.ImmutableSegmentLoader;
+import org.apache.pinot.segment.local.segment.readers.sort.PinotSegmentSorter;
+import org.apache.pinot.segment.spi.ColumnMetadata;
+import org.apache.pinot.segment.spi.IndexSegment;
+import org.apache.pinot.segment.spi.MutableSegment;
+import org.apache.pinot.segment.spi.datasource.DataSource;
+import org.apache.pinot.segment.spi.datasource.OpenStructDataSource;
+import org.apache.pinot.segment.spi.index.metadata.ColumnMetadataImpl;
+import org.apache.pinot.spi.data.Schema;
+import org.apache.pinot.spi.data.readers.GenericRow;
+import org.apache.pinot.spi.data.readers.RecordReader;
+import org.apache.pinot.spi.data.readers.RecordReaderConfig;
+import org.apache.pinot.spi.utils.ReadMode;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+
+/// Record reader for Pinot segment.
+public class PinotSegmentRecordReader implements RecordReader {
+  private static final Logger LOGGER = LoggerFactory.getLogger(PinotSegmentRecordReader.class);
+
+  private IndexSegment _indexSegment;
+  private boolean _destroySegmentOnClose;
+  private int _numDocs;
+
+  // These two collection allow for more efficient value reading - via indexes
+  private ArrayList<String> _columnNames;
+  private ArrayList<PinotSegmentColumnReader> _columnReaders;
+
+  private Map<String, PinotSegmentColumnReader> _columnReaderMap;
+  // OPEN_STRUCT parent columns have no forward index of their own (they expose per-key sub-columns),
+  // so they cannot be read via PinotSegmentColumnReader. Their per-doc value is reconstructed as a map.
+  private Map<String, OpenStructDataSource> _openStructDataSources;
+  // Scan-scoped readers opened once per column (see OpenStructDataSource#openMapValueReader), reused
+  // across every getRecord() call instead of reconstructing per-key forward-index readers per doc.
+  private Map<String, OpenStructDataSource.MapValueReader> _openStructMapValueReaders;
+  private int[] _sortedDocIds;
+  private boolean _skipDefaultNullValues;
+
+  private int _nextDocId = 0;
+
+  public PinotSegmentRecordReader() {
+  }
+
+  /// Deprecated: use empty constructor and init() instead.
+  ///
+  /// Read records using the segment schema
+  /// @param indexDir input path for the segment index
+  @Deprecated
+  public PinotSegmentRecordReader(File indexDir)
+      throws Exception {
+    try {
+      init(indexDir, null, null, false);
+    } catch (Exception e) {
+      close();
+      throw e;
+    }
+  }
+
+  /// Deprecated: use empty constructor and init() instead.
+  ///
+  /// Read records using the segment schema with the given schema and sort order
+  ///
+  /// Passed in schema must be a subset of the segment schema.
+  ///
+  /// @param indexDir input path for the segment index
+  /// @param schema input schema that is a subset of the segment schema
+  /// @param sortOrder a list of column names that represent the sorting order
+  @Deprecated
+  public PinotSegmentRecordReader(File indexDir, @Nullable Schema schema, @Nullable List<String> sortOrder)
+      throws Exception {
+    Set<String> fieldsToRead = schema != null ? schema.getPhysicalColumnNames() : null;
+    try {
+      init(indexDir, fieldsToRead, sortOrder, false);
+    } catch (Exception e) {
+      close();
+      throw e;
+    }
+  }
+
+  @Override
+  public void init(File indexDir, @Nullable Set<String> fieldsToRead, @Nullable RecordReaderConfig recordReaderConfig) {
+    init(indexDir, fieldsToRead, null, true);
+  }
+
+  /// Initializes the record reader from an index directory.
+  ///
+  /// @param indexDir Index directory
+  /// @param fieldsToRead The fields to read from the segment. If null or empty, reads all fields
+  /// @param sortOrder List of sorted columns
+  /// @param skipDefaultNullValues Whether to skip putting default null values into the record
+  public void init(File indexDir, @Nullable Set<String> fieldsToRead, @Nullable List<String> sortOrder,
+      boolean skipDefaultNullValues) {
+    init(indexDir, fieldsToRead, sortOrder, skipDefaultNullValues, false);
+  }
+
+  /// Initializes the record reader from an index directory with an option to skip column-level secondary indexes.
+  ///
+  /// @param indexDir Index directory
+  /// @param fieldsToRead The fields to read from the segment. If null or empty, reads all fields
+  /// @param sortOrder List of sorted columns
+  /// @param skipDefaultNullValues Whether to skip putting default null values into the record
+  /// @param forwardIndexOnly Whether to load only column-level forward index, dictionary, and null value vector,
+  ///                         skipping other column-level secondary indexes
+  public void init(File indexDir, @Nullable Set<String> fieldsToRead, @Nullable List<String> sortOrder,
+      boolean skipDefaultNullValues, boolean forwardIndexOnly) {
+    IndexSegment indexSegment;
+    try {
+      indexSegment = ImmutableSegmentLoader.load(indexDir, ReadMode.mmap, forwardIndexOnly);
+    } catch (Exception e) {
+      throw new RuntimeException("Caught exception while loading the segment from: " + indexDir, e);
+    }
+    init(indexSegment, true, fieldsToRead, null, sortOrder, skipDefaultNullValues);
+  }
+
+  /// Initializes the record reader from a segment.
+  ///
+  /// @param indexSegment Index segment to read from
+  public void init(IndexSegment indexSegment) {
+    init(indexSegment, false, null, null, null, false);
+  }
+
+  /// Initializes the record reader from a mutable segment with optional sorted document ids.
+  ///
+  /// @param mutableSegment Mutable segment
+  /// @param sortedDocIds Array of sorted document ids
+  public void init(MutableSegment mutableSegment, @Nullable int[] sortedDocIds) {
+    init(mutableSegment, false, null, sortedDocIds, null, false);
+  }
+
+  /// Initializes the record reader.
+  ///
+  /// @param indexSegment Index segment to read from
+  /// @param destroySegmentOnClose Whether to destroy the segment when closing the record reader
+  /// @param fieldsToRead The fields to read from the segment. If null or empty, reads all fields
+  /// @param sortedDocIds Array of sorted document ids
+  /// @param sortOrder List of sorted columns
+  /// @param skipDefaultNullValues Whether to skip putting default null values into the record
+  private void init(IndexSegment indexSegment, boolean destroySegmentOnClose, @Nullable Set<String> fieldsToRead,
+      @Nullable int[] sortedDocIds, @Nullable List<String> sortOrder, boolean skipDefaultNullValues) {
+    _indexSegment = indexSegment;
+    _destroySegmentOnClose = destroySegmentOnClose;
+    _numDocs = _indexSegment.getSegmentMetadata().getTotalDocs();
+
+    if (_numDocs > 0) {
+      _columnReaderMap = new HashMap<>();
+      _columnReaders = new ArrayList<>();
+      _columnNames = new ArrayList<>();
+      _openStructDataSources = new HashMap<>();
+      _openStructMapValueReaders = new HashMap<>();
+      Set<String> columnsInSegment = _indexSegment.getPhysicalColumnNames();
+      if (CollectionUtils.isEmpty(fieldsToRead)) {
+        for (String column : columnsInSegment) {
+          addColumnReader(column);
+        }
+      } else {
+        for (String column : fieldsToRead) {
+          if (columnsInSegment.contains(column)) {
+            addColumnReader(column);
+          } else {
+            LOGGER.warn("Ignoring column: {} that does not exist in the segment", column);
+          }
+        }
+      }
+
+      if (sortedDocIds != null) {
+        _sortedDocIds = sortedDocIds;
+      } else {
+        if (CollectionUtils.isNotEmpty(sortOrder)) {
+          _sortedDocIds = new PinotSegmentSorter(_numDocs, _columnReaderMap).getSortedDocIds(sortOrder);
+        } else {
+          _sortedDocIds = null;
+        }
+      }
+
+      _skipDefaultNullValues = skipDefaultNullValues;
+    }
+  }
+
+  /// Registers a reader for the given column. OPEN_STRUCT parent columns are tracked separately and
+  /// reconstructed as maps at read time (they have no forward index of their own); all other columns
+  /// use a [PinotSegmentColumnReader].
+  private void addColumnReader(String column) {
+    DataSource dataSource = _indexSegment.getDataSourceNullable(column);
+    if (dataSource instanceof OpenStructDataSource) {
+      OpenStructDataSource openStructDataSource = (OpenStructDataSource) dataSource;
+      _openStructDataSources.put(column, openStructDataSource);
+      _openStructMapValueReaders.put(column, openStructDataSource.openMapValueReader());
+      return;
+    }
+    if (isMaterializedOpenStructChild(column)) {
+      // A materialized OPEN_STRUCT/MAP child (e.g. "event$clicks") is a physical column on disk but
+      // not independently queryable -- it has no DataSource of its own (see
+      // ImmutableSegmentImpl#_dataSources), only its parent does, and the parent's OpenStructDataSource
+      // registered above already covers its value. This is reachable whenever the segment is loaded
+      // without an explicit table schema (e.g. the File-based constructors of this class), since
+      // SegmentMetadataImpl then self-derives a schema from every physical column on disk, children
+      // included.
+      return;
+    }
+    PinotSegmentColumnReader reader = new PinotSegmentColumnReader(_indexSegment, column);
+    _columnReaderMap.put(column, reader);
+    _columnNames.add(column);
+    _columnReaders.add(reader);
+  }
+
+  private boolean isMaterializedOpenStructChild(String column) {
+    // Mutable/consuming segments have no column metadata map (never materialize OPEN_STRUCT children
+    // on disk), so getColumnMetadataFor() would NPE on its unconditional map lookup.
+    Map<String, ColumnMetadata> columnMetadataMap = _indexSegment.getSegmentMetadata().getColumnMetadataMap();
+    if (columnMetadataMap == null) {
+      return false;
+    }
+    ColumnMetadata columnMetadata = columnMetadataMap.get(column);
+    return columnMetadata instanceof ColumnMetadataImpl && ((ColumnMetadataImpl) columnMetadata).isMaterializedChild();
+  }
+
+  /// Returns the sorted document ids.
+  @Nullable
+  public int[] getSortedDocIds() {
+    return _sortedDocIds;
+  }
+
+  @Override
+  public boolean hasNext() {
+    return _nextDocId < _numDocs;
+  }
+
+  @Override
+  public GenericRow next(GenericRow reuse) {
+    if (_sortedDocIds == null) {
+      getRecord(_nextDocId, reuse);
+    } else {
+      getRecord(_sortedDocIds[_nextDocId], reuse);
+    }
+    _nextDocId++;
+    return reuse;
+  }
+
+  public String getSegmentName() {
+    return _indexSegment.getSegmentName();
+  }
+
+  public void getRecord(int docId, GenericRow buffer) {
+    for (Map.Entry<String, PinotSegmentColumnReader> entry : _columnReaderMap.entrySet()) {
+      String column = entry.getKey();
+      PinotSegmentColumnReader columnReader = entry.getValue();
+      if (!columnReader.isNull(docId)) {
+        buffer.putValue(column, columnReader.getValue(docId));
+      } else if (!_skipDefaultNullValues) {
+        buffer.putDefaultNullValue(column, columnReader.getValue(docId));
+      }
+    }
+    for (Map.Entry<String, OpenStructDataSource.MapValueReader> entry : _openStructMapValueReaders.entrySet()) {
+      Map<String, Object> value = entry.getValue().getMapValue(docId);
+      // A null map means no key is present at this doc; leave the column unset so the OPEN_STRUCT
+      // build treats it as an absent/empty struct.
+      if (value != null) {
+        buffer.putValue(entry.getKey(), value);
+      }
+    }
+  }
+
+  public Object[] getRecordValues(int docId, int[] columnIndexes) {
+    Object[] values = new Object[columnIndexes.length];
+    for (int i = 0, n = columnIndexes.length; i < n; i++) {
+      int columnIndex = columnIndexes[i];
+      if (columnIndex > -1) {
+        PinotSegmentColumnReader columnReader = _columnReaders.get(columnIndex);
+        if (!columnReader.isNull(docId)) {
+          values[i] = columnReader.getValue(docId);
+        } else if (!_skipDefaultNullValues) {
+          values[i] = columnReader.getValue(docId);
+        } // else null value is kept
+      } // else keep null value
+    }
+
+    return values;
+  }
+
+  public int[] getIndexesForColumns(List<String> columnNames) {
+    int[] indexes = new int[columnNames.size()];
+
+    for (int i = 0, n = columnNames.size(); i < n; i++) {
+      indexes[i] = _columnNames.indexOf(columnNames.get(i));
+    }
+
+    return indexes;
+  }
+
+  // TODO:
+  //   - Currently there is no check on column existence
+  //   - Null value is not handled (default null value is returned)
+  public Object getValue(int docId, String column) {
+    OpenStructDataSource openStructDataSource = _openStructDataSources.get(column);
+    if (openStructDataSource != null) {
+      return openStructDataSource.getMapValue(docId);
+    }
+    return _columnReaderMap.get(column).getValue(docId);
+  }
+
+  @Override
+  public void rewind() {
+    _nextDocId = 0;
+  }
+
+  @Override
+  public void close()
+      throws IOException {
+    IOException closeException = null;
+    if (_columnReaderMap != null) {
+      try {
+        FileUtils.close(_columnReaderMap.values());
+      } catch (IOException e) {
+        closeException = e;
+      }
+    }
+    if (_openStructMapValueReaders != null) {
+      for (OpenStructDataSource.MapValueReader reader : _openStructMapValueReaders.values()) {
+        reader.close();
+      }
+    }
+    if (_destroySegmentOnClose && _indexSegment != null) {
+      _indexSegment.destroy();
+    }
+    if (closeException != null) {
+      throw closeException;
+    }
+  }
+}

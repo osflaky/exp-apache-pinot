@@ -1,0 +1,17 @@
+{
+  "tableName": "myTable",
+  "tableType": "OFFLINE",
+  "segmentsConfig": {
+    "segmentPushType": "APPEND",
+    "replication": "3"
+  },
+  "tenants": {
+  },
+  "tableIndexConfig": {
+    "loadMode": "HEAP"
+  },
+  "metadata": {
+    "customConfigs": {
+    }
+  }
+}

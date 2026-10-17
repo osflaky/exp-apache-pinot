@@ -1,0 +1,180 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pinot.query.type;
+
+import org.apache.calcite.rel.type.RelDataType;
+import org.apache.calcite.rel.type.RelDataTypeFactory;
+import org.apache.calcite.rel.type.RelDataTypeSystemImpl;
+import org.apache.calcite.sql.type.SqlTypeName;
+import org.apache.calcite.sql.type.SqlTypeUtil;
+
+
+/// The `TypeSystem` overwrites Calcite type system with Pinot specific logics.
+public class TypeSystem extends RelDataTypeSystemImpl {
+  public static final TypeSystem INSTANCE = new TypeSystem();
+
+  private static final int MAX_DECIMAL_SCALE = 1000;
+  private static final int MAX_DECIMAL_PRECISION = 2000;
+
+  // Pinot stores TIMESTAMP as epoch-millis (LONG), i.e. millisecond precision (3 fractional digits). This is also
+  // Calcite's MAX_DATETIME_PRECISION, so 3 is both the default and the max for TIMESTAMP and no clamping occurs.
+  private static final int TIMESTAMP_PRECISION_MILLIS = 3;
+
+  /// Default precision for derived arithmetic decimal types(plus/multiply/divide/mod). We won't allow the return
+  /// precision to be larger than this value majorly due to the following reasons:
+  ///
+  /// - 1. Precision computation is very costly, it should be explicitly specified
+  /// - 2. Work around the type hoist issue when doing de-correlation decimal type mismatch. See:
+  ///   [Derive SUM return type to be PostgreSQL compatible](https://github.com/apache/pinot/pull/11151)
+  ///   for more details
+  private static final int DERIVED_DECIMAL_PRECISION = 19;
+  private static final int DERIVED_DECIMAL_SCALE = 1;
+
+  private TypeSystem() {
+  }
+
+  @Override
+  public boolean shouldConvertRaggedUnionTypesToVarying() {
+    // A "ragged" union refers to a union of two or more data types that don't all
+    // have the same precision or scale. In these cases, Calcite may need to promote
+    // one or more of the data types in order to maintain consistency.
+    //
+    // Pinot doesn't properly handle CHAR(FIXED) - by default, Calcite will cast a
+    // CHAR(2) to a CHAR(3), but this will cause 2-char strings to be expanded with
+    // spaces at the end (e.g. 'No' -> 'No '), which ultimately causes incorrect
+    // behavior. This calcite flag will cause this to be cast to VARCHAR instead
+    return true;
+  }
+
+  // Pinot raises the max DECIMAL precision/scale far above the SQL standard via the type-specific
+  // getMaxScale(DECIMAL)/getMaxPrecision(DECIMAL) overrides below. The no-arg getMaxNumericScale()/
+  // getMaxNumericPrecision() became final in Calcite 1.42.0 (CALCITE-7351) and now delegate to
+  // getMaxScale(DECIMAL)/getMaxPrecision(DECIMAL), so overriding them is no longer possible - and no longer
+  // necessary, since that delegation already yields MAX_DECIMAL_SCALE/MAX_DECIMAL_PRECISION.
+  @Override
+  public int getMaxScale(SqlTypeName typeName) {
+    return typeName == SqlTypeName.DECIMAL ? MAX_DECIMAL_SCALE : super.getMaxScale(typeName);
+  }
+
+  @Override
+  public int getDefaultScale(SqlTypeName typeName) {
+    return typeName == SqlTypeName.DECIMAL ? MAX_DECIMAL_SCALE : super.getDefaultScale(typeName);
+  }
+
+  @Override
+  public int getMaxPrecision(SqlTypeName typeName) {
+    return typeName == SqlTypeName.DECIMAL ? MAX_DECIMAL_PRECISION : super.getMaxPrecision(typeName);
+  }
+
+  @Override
+  public int getDefaultPrecision(SqlTypeName typeName) {
+    if (typeName == SqlTypeName.DECIMAL) {
+      return MAX_DECIMAL_PRECISION;
+    }
+    if (typeName == SqlTypeName.TIMESTAMP) {
+      // Calcite's default TIMESTAMP precision is 0 (whole seconds), which truncates sub-second epoch-millis literals
+      // during constant folding (RexBuilder.clean -> TimestampString.round). Pin it to millisecond precision so folded
+      // TIMESTAMP literals preserve millis and round-trip Pinot's LONG storage. See issue #18881.
+      return TIMESTAMP_PRECISION_MILLIS;
+    }
+    return super.getDefaultPrecision(typeName);
+  }
+
+  @Override
+  public RelDataType deriveAvgAggType(RelDataTypeFactory typeFactory, RelDataType argumentType) {
+    switch (argumentType.getSqlTypeName()) {
+      case DECIMAL: {
+        // For BIG_DECIMAL, set the return type to BIG_DECIMAL. Check OSS issue #10318 for more details.
+        return argumentType;
+      }
+      default: {
+        return typeFactory.createTypeWithNullability(typeFactory.createSqlType(SqlTypeName.DOUBLE), false);
+      }
+    }
+  }
+
+  @Override
+  public RelDataType deriveSumType(RelDataTypeFactory typeFactory, RelDataType argumentType) {
+    if (argumentType.getComponentType() != null) {
+      // For MV columns, the return type for SUM is the same as the return type for SUM on the individual element type.
+      return deriveSumType(typeFactory, argumentType.getComponentType());
+    }
+
+    assert SqlTypeUtil.isNumeric(argumentType);
+    switch (argumentType.getSqlTypeName()) {
+      case TINYINT:
+      case SMALLINT:
+      case INTEGER:
+      case BIGINT:
+      // Calcite 1.41+ (CALCITE-1466) makes unsigned integer types reachable under BABEL conformance. Widen the
+      // supported ones to (signed) BIGINT for SUM exactly like their signed counterparts; Calcite passes the operand
+      // type to deriveSumType directly (no unsigned->signed coercion), so without these arms a SUM over a sub-64-bit
+      // unsigned column would keep its narrow type and silently overflow a 32-bit INT when accumulating many rows.
+      // UBIGINT is intentionally omitted: it is unsupported (rejected during plan conversion) because no signed type
+      // holds its full 0..2^64-1 range.
+      case UTINYINT:
+      case USMALLINT:
+      case UINTEGER:
+        return typeFactory.createTypeWithNullability(typeFactory.createSqlType(SqlTypeName.BIGINT),
+            argumentType.isNullable());
+      default:
+        return argumentType;
+    }
+  }
+
+  @Override
+  public RelDataType deriveDecimalPlusType(RelDataTypeFactory typeFactory, RelDataType type1, RelDataType type2) {
+    RelDataType dataType = super.deriveDecimalPlusType(typeFactory, type1, type2);
+    if (dataType != null && SqlTypeUtil.isExactNumeric(dataType) && SqlTypeUtil.isDecimal(dataType) && (
+        dataType.getPrecision() > DERIVED_DECIMAL_PRECISION)) {
+      return typeFactory.createSqlType(SqlTypeName.DECIMAL, DERIVED_DECIMAL_PRECISION, DERIVED_DECIMAL_SCALE);
+    }
+    return dataType;
+  }
+
+  @Override
+  public RelDataType deriveDecimalMultiplyType(RelDataTypeFactory typeFactory, RelDataType type1, RelDataType type2) {
+    RelDataType dataType = super.deriveDecimalMultiplyType(typeFactory, type1, type2);
+    if (dataType != null && SqlTypeUtil.isExactNumeric(dataType) && SqlTypeUtil.isDecimal(dataType) && (
+        dataType.getPrecision() > DERIVED_DECIMAL_PRECISION)) {
+      return typeFactory.createSqlType(SqlTypeName.DECIMAL, DERIVED_DECIMAL_PRECISION, DERIVED_DECIMAL_SCALE);
+    }
+    return dataType;
+  }
+
+  @Override
+  public RelDataType deriveDecimalDivideType(RelDataTypeFactory typeFactory, RelDataType type1, RelDataType type2) {
+    RelDataType dataType = super.deriveDecimalDivideType(typeFactory, type1, type2);
+    if (dataType != null && SqlTypeUtil.isExactNumeric(dataType) && SqlTypeUtil.isDecimal(dataType) && (
+        dataType.getPrecision() > DERIVED_DECIMAL_PRECISION)) {
+      return typeFactory.createSqlType(SqlTypeName.DECIMAL, DERIVED_DECIMAL_PRECISION, DERIVED_DECIMAL_SCALE);
+    }
+    return dataType;
+  }
+
+  @Override
+  public RelDataType deriveDecimalModType(RelDataTypeFactory typeFactory, RelDataType type1, RelDataType type2) {
+    RelDataType dataType = super.deriveDecimalModType(typeFactory, type1, type2);
+    if (dataType != null && SqlTypeUtil.isExactNumeric(dataType) && SqlTypeUtil.isDecimal(dataType) && (
+        dataType.getPrecision() > DERIVED_DECIMAL_PRECISION)) {
+      return typeFactory.createSqlType(SqlTypeName.DECIMAL, DERIVED_DECIMAL_PRECISION, DERIVED_DECIMAL_SCALE);
+    }
+    return dataType;
+  }
+}

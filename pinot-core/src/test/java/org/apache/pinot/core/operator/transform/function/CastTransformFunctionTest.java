@@ -1,0 +1,460 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pinot.core.operator.transform.function;
+
+import java.math.BigDecimal;
+import java.sql.Timestamp;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
+import org.apache.pinot.common.request.context.ExpressionContext;
+import org.apache.pinot.common.request.context.LiteralContext;
+import org.apache.pinot.common.request.context.RequestContextUtils;
+import org.apache.pinot.core.operator.transform.TransformResultMetadata;
+import org.apache.pinot.spi.data.FieldSpec;
+import org.apache.pinot.spi.exception.BadQueryRequestException;
+import org.apache.pinot.spi.utils.ArrayCopyUtils;
+import org.apache.pinot.spi.utils.BytesUtils;
+import org.apache.pinot.spi.utils.CommonConstants.NullValuePlaceHolder;
+import org.apache.pinot.spi.utils.UuidUtils;
+import org.roaringbitmap.RoaringBitmap;
+import org.testng.Assert;
+import org.testng.annotations.Test;
+
+import static org.apache.pinot.common.function.scalar.DataTypeConversionFunctions.cast;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertFalse;
+import static org.testng.Assert.assertTrue;
+
+
+public class CastTransformFunctionTest extends BaseTransformFunctionTest {
+  private static final String UUID_VALUE = "550e8400-e29b-41d4-a716-446655440000";
+  @Test
+  public void testCastUuidToString() {
+    String uuid = "550e8400-e29b-41d4-a716-446655440000";
+    ExpressionContext expression = RequestContextUtils.getExpression("CAST(toUuid('" + uuid + "') AS STRING)");
+    TransformFunction transformFunction = TransformFunctionFactory.get(expression, _dataSourceMap);
+
+    String[] expectedValues = new String[NUM_ROWS];
+    Arrays.fill(expectedValues, uuid);
+    testTransformFunction(transformFunction, expectedValues);
+  }
+
+  @Test
+  public void testCastNullableUuidToString() {
+    String uuid = "550e8400-e29b-41d4-a716-446655440000";
+    byte[][] uuidValues = new byte[NUM_ROWS][];
+    String[] expectedValues = new String[NUM_ROWS];
+    RoaringBitmap nullBitmap = new RoaringBitmap();
+    for (int i = 0; i < NUM_ROWS; i++) {
+      if (isNullRow(i)) {
+        uuidValues[i] = NullValuePlaceHolder.BYTES;
+        nullBitmap.add(i);
+      } else {
+        uuidValues[i] = UuidUtils.toBytes(uuid);
+        expectedValues[i] = uuid;
+      }
+    }
+
+    TransformFunction uuidTransformFunction = mock(TransformFunction.class);
+    when(uuidTransformFunction.getResultMetadata())
+        .thenReturn(new TransformResultMetadata(FieldSpec.DataType.UUID, true, false));
+    when(uuidTransformFunction.transformToBytesValuesSV(_projectionBlock)).thenReturn(uuidValues);
+    when(uuidTransformFunction.getNullBitmap(_projectionBlock)).thenReturn(nullBitmap);
+
+    CastTransformFunction castTransformFunction = createUuidCastFunction(uuidTransformFunction, true);
+    testTransformFunctionWithNull(castTransformFunction, expectedValues, nullBitmap);
+  }
+
+  @Test
+  public void testCastUuidMvToString() {
+    String firstUuid = "550e8400-e29b-41d4-a716-446655440000";
+    String secondUuid = "123e4567-e89b-12d3-a456-426614174000";
+    byte[][][] uuidValues = new byte[NUM_ROWS][][];
+    String[][] expectedValues = new String[NUM_ROWS][];
+    for (int i = 0; i < NUM_ROWS; i++) {
+      uuidValues[i] = new byte[][]{UuidUtils.toBytes(firstUuid), UuidUtils.toBytes(secondUuid)};
+      expectedValues[i] = new String[]{firstUuid, secondUuid};
+    }
+
+    TransformFunction uuidTransformFunction = mock(TransformFunction.class);
+    when(uuidTransformFunction.getResultMetadata())
+        .thenReturn(new TransformResultMetadata(FieldSpec.DataType.UUID, false, false));
+    when(uuidTransformFunction.transformToBytesValuesMV(_projectionBlock)).thenReturn(uuidValues);
+
+    CastTransformFunction castTransformFunction = createUuidCastFunction(uuidTransformFunction, false);
+    testTransformFunctionMV(castTransformFunction, expectedValues);
+  }
+
+  private static CastTransformFunction createUuidCastFunction(TransformFunction uuidTransformFunction,
+      boolean nullHandlingEnabled) {
+    CastTransformFunction castTransformFunction = new CastTransformFunction();
+    LiteralTransformFunction targetType =
+        new LiteralTransformFunction(new LiteralContext(FieldSpec.DataType.STRING, "STRING"));
+    castTransformFunction.init(List.of(uuidTransformFunction, targetType), Map.of(), nullHandlingEnabled);
+    return castTransformFunction;
+  }
+
+  @Test
+  public void testCastTransformFunction() {
+    ExpressionContext expression =
+        RequestContextUtils.getExpression(String.format("CAST(%s AS string)", INT_SV_COLUMN));
+    TransformFunction transformFunction = TransformFunctionFactory.get(expression, _dataSourceMap);
+    assertTrue(transformFunction instanceof CastTransformFunction);
+    assertEquals(transformFunction.getName(), CastTransformFunction.FUNCTION_NAME);
+    String[] expectedStringValues = new String[NUM_ROWS];
+    String[] scalarStringValues = new String[NUM_ROWS];
+    for (int i = 0; i < NUM_ROWS; i++) {
+      expectedStringValues[i] = Integer.toString(_intSVValues[i]);
+      scalarStringValues[i] = (String) cast(_intSVValues[i], "string");
+    }
+    testTransformFunction(transformFunction, expectedStringValues);
+    assertEquals(expectedStringValues, scalarStringValues);
+
+    expression = RequestContextUtils.getExpression(String.format("CAST(CAST(%s as INT) as FLOAT)", FLOAT_SV_COLUMN));
+    transformFunction = TransformFunctionFactory.get(expression, _dataSourceMap);
+    assertTrue(transformFunction instanceof CastTransformFunction);
+    float[] expectedFloatValues = new float[NUM_ROWS];
+    float[] scalarFloatValues = new float[NUM_ROWS];
+    for (int i = 0; i < NUM_ROWS; i++) {
+      expectedFloatValues[i] = (int) _floatSVValues[i];
+      scalarFloatValues[i] = (float) cast(cast(_floatSVValues[i], "int"), "float");
+    }
+    testTransformFunction(transformFunction, expectedFloatValues);
+    assertEquals(expectedFloatValues, scalarFloatValues);
+
+    expression = RequestContextUtils.getExpression(String.format("CAST(CAST(%s as BOOLEAN) as STRING)", INT_SV_COLUMN));
+    transformFunction = TransformFunctionFactory.get(expression, _dataSourceMap);
+    assertTrue(transformFunction instanceof CastTransformFunction);
+    for (int i = 0; i < NUM_ROWS; i++) {
+      expectedStringValues[i] = Boolean.toString(_intSVValues[i] != 0);
+      scalarStringValues[i] = (String) cast(cast(_intSVValues[i], "boolean"), "string");
+    }
+    testTransformFunction(transformFunction, expectedStringValues);
+    assertEquals(expectedStringValues, scalarStringValues);
+
+    expression =
+        RequestContextUtils.getExpression(String.format("CAST(CAST(%s as TIMESTAMP) as STRING)", LONG_SV_COLUMN));
+    transformFunction = TransformFunctionFactory.get(expression, _dataSourceMap);
+    assertTrue(transformFunction instanceof CastTransformFunction);
+    for (int i = 0; i < NUM_ROWS; i++) {
+      expectedStringValues[i] = new Timestamp(_longSVValues[i]).toString();
+      scalarStringValues[i] = (String) cast(cast(_longSVValues[i], "timestamp"), "string");
+    }
+    testTransformFunction(transformFunction, expectedStringValues);
+    assertEquals(expectedStringValues, scalarStringValues);
+
+    expression = RequestContextUtils.getExpression(String.format("CAST(CAST(%s as BOOLEAN) as INT)", INT_SV_COLUMN));
+    transformFunction = TransformFunctionFactory.get(expression, _dataSourceMap);
+    assertTrue(transformFunction instanceof CastTransformFunction);
+    int[] expectedIntValues = new int[NUM_ROWS];
+    int[] scalarIntValues = new int[NUM_ROWS];
+    for (int i = 0; i < NUM_ROWS; i++) {
+      expectedIntValues[i] = _intSVValues[i] != 0 ? 1 : 0;
+      scalarIntValues[i] = (int) cast(cast(_intSVValues[i], "boolean"), "int");
+    }
+    testTransformFunction(transformFunction, expectedIntValues);
+    assertEquals(expectedIntValues, scalarIntValues);
+
+    expression = RequestContextUtils.getExpression(
+        String.format("CAST(ADD(CAST(%s AS LONG), %s) AS STRING)", DOUBLE_SV_COLUMN, LONG_SV_COLUMN));
+    transformFunction = TransformFunctionFactory.get(expression, _dataSourceMap);
+    assertTrue(transformFunction instanceof CastTransformFunction);
+    for (int i = 0; i < NUM_ROWS; i++) {
+      expectedStringValues[i] = Double.toString((double) (long) _doubleSVValues[i] + (double) _longSVValues[i]);
+      scalarStringValues[i] =
+          (String) cast((double) (long) cast(_doubleSVValues[i], "long") + (double) _longSVValues[i], "string");
+    }
+    testTransformFunction(transformFunction, expectedStringValues);
+    assertEquals(expectedStringValues, scalarStringValues);
+
+    expression = RequestContextUtils.getExpression(
+        String.format("caSt(cAst(casT(%s as inT) + %s aS sTring) As DouBle)", FLOAT_SV_COLUMN, INT_SV_COLUMN));
+    transformFunction = TransformFunctionFactory.get(expression, _dataSourceMap);
+    assertTrue(transformFunction instanceof CastTransformFunction);
+    double[] expectedDoubleValues = new double[NUM_ROWS];
+    double[] scalarDoubleValues = new double[NUM_ROWS];
+    for (int i = 0; i < NUM_ROWS; i++) {
+      expectedDoubleValues[i] = (double) (int) _floatSVValues[i] + (double) _intSVValues[i];
+      scalarDoubleValues[i] =
+          (double) cast(cast((double) (int) cast(_floatSVValues[i], "int") + (double) _intSVValues[i], "string"),
+              "double");
+    }
+    testTransformFunction(transformFunction, expectedDoubleValues);
+    assertEquals(expectedDoubleValues, scalarDoubleValues);
+
+    expression = RequestContextUtils.getExpression(
+        String.format("CAST(CAST(%s AS INT) - CAST(%s AS FLOAT) / CAST(%s AS DOUBLE) AS LONG)", DOUBLE_SV_COLUMN,
+            LONG_SV_COLUMN, INT_SV_COLUMN));
+    transformFunction = TransformFunctionFactory.get(expression, _dataSourceMap);
+    assertTrue(transformFunction instanceof CastTransformFunction);
+    long[] expectedLongValues = new long[NUM_ROWS];
+    long[] longScalarValues = new long[NUM_ROWS];
+    for (int i = 0; i < NUM_ROWS; i++) {
+      expectedLongValues[i] =
+          (long) ((double) (int) _doubleSVValues[i] - (double) (float) _longSVValues[i] / (double) _intSVValues[i]);
+      longScalarValues[i] = (long) cast((double) (int) cast(_doubleSVValues[i], "int")
+          - (double) (float) cast(_longSVValues[i], "float") / (double) cast(_intSVValues[i], "double"), "long");
+    }
+    testTransformFunction(transformFunction, expectedLongValues);
+    assertEquals(expectedLongValues, longScalarValues);
+
+    expression = RequestContextUtils.getExpression(String.format("CAST(%s AS BIG_DECIMAL)", LONG_SV_COLUMN));
+    transformFunction = TransformFunctionFactory.get(expression, _dataSourceMap);
+    assertTrue(transformFunction instanceof CastTransformFunction);
+    BigDecimal[] expectedBigDecimalValues = new BigDecimal[NUM_ROWS];
+    BigDecimal[] bigDecimalScalarValues = new BigDecimal[NUM_ROWS];
+    for (int i = 0; i < NUM_ROWS; i++) {
+      expectedBigDecimalValues[i] = BigDecimal.valueOf(_longSVValues[i]);
+      bigDecimalScalarValues[i] = (BigDecimal) cast(_longSVValues[i], "BIG_DECIMAL");
+    }
+    testTransformFunction(transformFunction, expectedBigDecimalValues);
+    assertEquals(expectedBigDecimalValues, bigDecimalScalarValues);
+
+    expression = RequestContextUtils.getExpression(
+        String.format("CAST(CAST(%s AS DOUBLE) - CAST(%s AS DOUBLE) / CAST(%s AS DOUBLE) AS BIG_DECIMAL)",
+            BIG_DECIMAL_SV_COLUMN, LONG_SV_COLUMN, INT_SV_COLUMN));
+    transformFunction = TransformFunctionFactory.get(expression, _dataSourceMap);
+    assertTrue(transformFunction instanceof CastTransformFunction);
+    expectedBigDecimalValues = new BigDecimal[NUM_ROWS];
+    for (int i = 0; i < NUM_ROWS; i++) {
+      expectedBigDecimalValues[i] = BigDecimal.valueOf(
+          _bigDecimalSVValues[i].doubleValue() - (double) _longSVValues[i] / (double) _intSVValues[i]);
+      double d =
+          (double) cast(_bigDecimalSVValues[i], "double") - (double) cast(_longSVValues[i], "double") / (double) cast(
+              _intSVValues[i], "double");
+      bigDecimalScalarValues[i] = (BigDecimal) cast(d, "BIG_DECIMAL");
+    }
+    testTransformFunction(transformFunction, expectedBigDecimalValues);
+    assertEquals(expectedBigDecimalValues, bigDecimalScalarValues);
+  }
+
+  @Test
+  public void testCastTransformFunctionMV() {
+    ExpressionContext expression =
+        RequestContextUtils.getExpression(String.format("CAST(%s AS LONG)", STRING_LONG_MV_COLUMN));
+    TransformFunction transformFunction = TransformFunctionFactory.get(expression, _dataSourceMap);
+    assertTrue(transformFunction instanceof CastTransformFunction);
+    assertEquals(transformFunction.getName(), CastTransformFunction.FUNCTION_NAME);
+    long[][] expectedLongValues = new long[NUM_ROWS][];
+    ArrayCopyUtils.copy(_stringLongFormatMVValues, expectedLongValues, NUM_ROWS);
+    testTransformFunctionMV(transformFunction, expectedLongValues);
+
+    expression = RequestContextUtils.getExpression(
+        String.format("CAST(CAST(CAST(%s AS LONG) as DOUBLE) as INT)", STRING_LONG_MV_COLUMN));
+    transformFunction = TransformFunctionFactory.get(expression, _dataSourceMap);
+    assertTrue(transformFunction instanceof CastTransformFunction);
+    assertEquals(transformFunction.getName(), CastTransformFunction.FUNCTION_NAME);
+    long[][] innerLongValues = new long[NUM_ROWS][];
+    ArrayCopyUtils.copy(_stringLongFormatMVValues, innerLongValues, NUM_ROWS);
+    double[][] innerDoubleValues = new double[NUM_ROWS][];
+    ArrayCopyUtils.copy(innerLongValues, innerDoubleValues, NUM_ROWS);
+    int[][] expectedIntValues = new int[NUM_ROWS][];
+    ArrayCopyUtils.copy(innerDoubleValues, expectedIntValues, NUM_ROWS);
+    testTransformFunctionMV(transformFunction, expectedIntValues);
+
+    expression = RequestContextUtils.getExpression(String.format("CAST(CAST(%s AS INT) as FLOAT)", FLOAT_MV_COLUMN));
+    transformFunction = TransformFunctionFactory.get(expression, _dataSourceMap);
+    assertTrue(transformFunction instanceof CastTransformFunction);
+    assertEquals(transformFunction.getName(), CastTransformFunction.FUNCTION_NAME);
+    int[][] innerLayerInt = new int[NUM_ROWS][];
+    ArrayCopyUtils.copy(_floatMVValues, innerLayerInt, NUM_ROWS);
+    float[][] expectedFloatValues = new float[NUM_ROWS][];
+    ArrayCopyUtils.copy(innerLayerInt, expectedFloatValues, NUM_ROWS);
+    testTransformFunctionMV(transformFunction, expectedFloatValues);
+
+    expression = RequestContextUtils.getExpression(
+        String.format("CAST(CAST(CAST(%s AS FLOAT) as INT) as STRING)", INT_MV_COLUMN));
+    transformFunction = TransformFunctionFactory.get(expression, _dataSourceMap);
+    assertTrue(transformFunction instanceof CastTransformFunction);
+    assertEquals(transformFunction.getName(), CastTransformFunction.FUNCTION_NAME);
+    float[][] innerFloatValues = new float[NUM_ROWS][];
+    ArrayCopyUtils.copy(_intMVValues, innerFloatValues, NUM_ROWS);
+    innerLayerInt = new int[NUM_ROWS][];
+    ArrayCopyUtils.copy(innerFloatValues, innerLayerInt, NUM_ROWS);
+    String[][] expectedStringValues = new String[NUM_ROWS][];
+    ArrayCopyUtils.copy(innerLayerInt, expectedStringValues, NUM_ROWS);
+    testTransformFunctionMV(transformFunction, expectedStringValues);
+
+    expression = RequestContextUtils.getExpression(String.format("CAST(CAST(%s as BOOLEAN) as STRING)", INT_MV_COLUMN));
+    transformFunction = TransformFunctionFactory.get(expression, _dataSourceMap);
+    assertTrue(transformFunction instanceof CastTransformFunction);
+    for (int i = 0; i < NUM_ROWS; i++) {
+      int length = _intMVValues[i].length;
+      expectedStringValues[i] = new String[length];
+      for (int j = 0; j < length; j++) {
+        expectedStringValues[i][j] = Boolean.toString(_intMVValues[i][j] != 0);
+      }
+    }
+    testTransformFunctionMV(transformFunction, expectedStringValues);
+
+    expression =
+        RequestContextUtils.getExpression(String.format("CAST(CAST(%s as TIMESTAMP) as STRING)", LONG_SV_COLUMN));
+    transformFunction = TransformFunctionFactory.get(expression, _dataSourceMap);
+    assertTrue(transformFunction instanceof CastTransformFunction);
+    for (int i = 0; i < NUM_ROWS; i++) {
+      int length = _longMVValues[i].length;
+      expectedStringValues[i] = new String[length];
+      for (int j = 0; j < length; j++) {
+        expectedStringValues[i][j] = new Timestamp(_longMVValues[i][j]).toString();
+      }
+    }
+
+    expression = RequestContextUtils.getExpression(String.format("arrayMax(cAst(%s AS INT))", DOUBLE_MV_COLUMN));
+    transformFunction = TransformFunctionFactory.get(expression, _dataSourceMap);
+    FieldSpec.DataType resultDataType = transformFunction.getResultMetadata().getDataType();
+    assertEquals(resultDataType, FieldSpec.DataType.INT);
+
+    // checks that arraySum triggers transformToDoubleMV in cast function which correctly cast to INT
+    expression = RequestContextUtils.getExpression(String.format("arraySum(cAst(%s AS INT))", DOUBLE_MV_COLUMN));
+    transformFunction = TransformFunctionFactory.get(expression, _dataSourceMap);
+    int[][] afterCast = new int[NUM_ROWS][];
+    ArrayCopyUtils.copy(_doubleMVValues, afterCast, NUM_ROWS);
+    double[] expectedArraySums = new double[NUM_ROWS];
+    for (int i = 0; i < NUM_ROWS; i++) {
+      expectedArraySums[i] = Arrays.stream(afterCast[i]).sum();
+    }
+    testTransformFunction(transformFunction, expectedArraySums);
+  }
+
+  @Test
+  public void testCastTransformFunctionBytesArray() {
+    ExpressionContext expression =
+        RequestContextUtils.getExpression(String.format("CAST(%s AS BYTES_ARRAY)", STRING_MV_COLUMN));
+    TransformFunction transformFunction = TransformFunctionFactory.get(expression, _dataSourceMap);
+    assertTrue(transformFunction instanceof CastTransformFunction);
+    TransformResultMetadata resultMetadata = transformFunction.getResultMetadata();
+    assertEquals(resultMetadata.getDataType(), FieldSpec.DataType.BYTES);
+    assertFalse(resultMetadata.isSingleValue());
+
+    byte[][][] expectedBytesValues = new byte[NUM_ROWS][][];
+    ArrayCopyUtils.copy(_stringMVValues, expectedBytesValues, NUM_ROWS);
+    assertEquals(transformFunction.transformToBytesValuesMV(_projectionBlock), expectedBytesValues);
+  }
+
+  @Test
+  public void testCastNullLiteral() {
+    ExpressionContext expression = RequestContextUtils.getExpression("cast(null AS INT)");
+    TransformFunction transformFunction = TransformFunctionFactory.get(expression, _dataSourceMap);
+    Assert.assertTrue(transformFunction instanceof CastTransformFunction);
+    Assert.assertEquals(transformFunction.getName(), CastTransformFunction.FUNCTION_NAME);
+    int[] expectedValues = new int[NUM_ROWS];
+    RoaringBitmap roaringBitmap = new RoaringBitmap();
+    roaringBitmap.add(0L, NUM_ROWS);
+    testTransformFunctionWithNull(transformFunction, expectedValues, roaringBitmap);
+  }
+
+  @Test
+  public void testCastNullColumn() {
+    ExpressionContext expression =
+        RequestContextUtils.getExpression(String.format("cast(%s AS INT)", INT_SV_NULL_COLUMN));
+    TransformFunction transformFunction = TransformFunctionFactory.get(expression, _dataSourceMap);
+    Assert.assertTrue(transformFunction instanceof CastTransformFunction);
+    Assert.assertEquals(transformFunction.getName(), CastTransformFunction.FUNCTION_NAME);
+    int[] expectedValues = new int[NUM_ROWS];
+    RoaringBitmap roaringBitmap = new RoaringBitmap();
+    for (int i = 0; i < NUM_ROWS; i++) {
+      if (isNullRow(i)) {
+        roaringBitmap.add(i);
+      } else {
+        expectedValues[i] = _intSVValues[i];
+      }
+    }
+    testTransformFunctionWithNull(transformFunction, expectedValues, roaringBitmap);
+  }
+
+  @Test
+  public void testCastTransformFunctionUUID() {
+    ExpressionContext expression =
+        RequestContextUtils.getExpression(String.format("CAST('%s' AS UUID)", UUID_VALUE.toUpperCase()));
+    TransformFunction transformFunction = TransformFunctionFactory.get(expression, _dataSourceMap);
+    assertTrue(transformFunction instanceof CastTransformFunction);
+    assertEquals(transformFunction.getResultMetadata().getDataType(), FieldSpec.DataType.UUID);
+
+    byte[][] bytesValues = transformFunction.transformToBytesValuesSV(_projectionBlock);
+    String[] stringValues = transformFunction.transformToStringValuesSV(_projectionBlock);
+    byte[] expectedBytes = UuidUtils.toBytes(UUID_VALUE);
+    for (int i = 0; i < NUM_ROWS; i++) {
+      assertEquals(bytesValues[i], expectedBytes);
+      assertEquals(stringValues[i], UUID_VALUE);
+    }
+  }
+
+  @Test
+  public void testCastTransformFunctionUuidRoundTrips() {
+    String bytesHex = BytesUtils.toHexString(UuidUtils.toBytes(UUID_VALUE));
+
+    ExpressionContext expression = RequestContextUtils.getExpression(
+        String.format("CAST(CAST('%s' AS BYTES) AS UUID)", bytesHex));
+    TransformFunction transformFunction = TransformFunctionFactory.get(expression, _dataSourceMap);
+    byte[] expectedBytes = UuidUtils.toBytes(UUID_VALUE);
+    byte[][] expectedUuidValues = new byte[NUM_ROWS][];
+    for (int i = 0; i < NUM_ROWS; i++) {
+      expectedUuidValues[i] = expectedBytes;
+    }
+    testTransformFunction(transformFunction, expectedUuidValues);
+
+    expression = RequestContextUtils.getExpression(String.format("CAST(CAST('%s' AS UUID) AS STRING)", UUID_VALUE));
+    transformFunction = TransformFunctionFactory.get(expression, _dataSourceMap);
+    String[] expectedStringValues = new String[NUM_ROWS];
+    Arrays.fill(expectedStringValues, UUID_VALUE);
+    testTransformFunction(transformFunction, expectedStringValues);
+
+    expression = RequestContextUtils.getExpression(String.format("CAST(CAST('%s' AS UUID) AS BYTES)", UUID_VALUE));
+    transformFunction = TransformFunctionFactory.get(expression, _dataSourceMap);
+    byte[][] expectedBytesValues = new byte[NUM_ROWS][];
+    for (int i = 0; i < NUM_ROWS; i++) {
+      expectedBytesValues[i] = expectedBytes;
+    }
+    testTransformFunction(transformFunction, expectedBytesValues);
+  }
+
+  @Test
+  public void testCastTransformFunctionUUIDRejectsInvalidLiteral() {
+    ExpressionContext expression = RequestContextUtils.getExpression("CAST('not-a-uuid' AS UUID)");
+    TransformFunction transformFunction = TransformFunctionFactory.get(expression, _dataSourceMap);
+    assertTrue(transformFunction instanceof CastTransformFunction);
+
+    IllegalArgumentException exception = Assert.expectThrows(IllegalArgumentException.class,
+        () -> transformFunction.transformToBytesValuesSV(_projectionBlock));
+    assertTrue(exception.getMessage().contains("Invalid UUID"));
+  }
+
+  @Test
+  public void testCastTransformFunctionUUIDRejectsInvalidBytesLiteral() {
+    ExpressionContext expression = RequestContextUtils.getExpression("CAST(CAST('0011' AS BYTES) AS UUID)");
+    TransformFunction transformFunction = TransformFunctionFactory.get(expression, _dataSourceMap);
+    assertTrue(transformFunction instanceof CastTransformFunction);
+
+    IllegalArgumentException exception = Assert.expectThrows(IllegalArgumentException.class,
+        () -> transformFunction.transformToBytesValuesSV(_projectionBlock));
+    assertTrue(exception.getMessage().contains("Invalid UUID byte length"));
+  }
+
+  @Test
+  public void testCastTransformFunctionUUIDRejectsMVSource() {
+    ExpressionContext expression =
+        RequestContextUtils.getExpression(String.format("CAST(%s AS UUID)", STRING_MV_COLUMN));
+    BadQueryRequestException exception = Assert.expectThrows(BadQueryRequestException.class,
+        () -> TransformFunctionFactory.get(expression, _dataSourceMap));
+    assertTrue(exception.getMessage().contains("Cannot cast from MV to UUID"));
+  }
+}

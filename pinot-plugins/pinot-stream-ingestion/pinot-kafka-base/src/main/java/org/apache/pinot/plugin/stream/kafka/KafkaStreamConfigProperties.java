@@ -1,0 +1,74 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pinot.plugin.stream.kafka;
+
+import com.google.common.base.Joiner;
+import org.apache.pinot.spi.stream.StreamConfigProperties;
+
+
+/// Property key definitions for all kafka stream related properties
+public class KafkaStreamConfigProperties {
+  private KafkaStreamConfigProperties() {
+  }
+
+  public static final String DOT_SEPARATOR = ".";
+  public static final String STREAM_TYPE = "kafka";
+
+  /// Helper method to create a property string for kafka stream
+  /// @param property
+  /// @return
+  public static String constructStreamProperty(String property) {
+    return Joiner.on(DOT_SEPARATOR).join(StreamConfigProperties.STREAM_PREFIX, property);
+  }
+
+  public static class LowLevelConsumer {
+    public static final String KAFKA_BROKER_LIST = "kafka.broker.list";
+    public static final String KAFKA_BUFFER_SIZE = "kafka.buffer.size";
+    public static final int KAFKA_BUFFER_SIZE_DEFAULT = 512000;
+    public static final String KAFKA_SOCKET_TIMEOUT = "kafka.socket.timeout";
+    public static final int KAFKA_SOCKET_TIMEOUT_DEFAULT = 10000;
+    public static final String KAFKA_FETCHER_SIZE_BYTES = "kafka.fetcher.size";
+    public static final String KAFKA_FETCHER_MIN_BYTES = "kafka.fetcher.minBytes";
+    public static final int KAFKA_FETCHER_MIN_BYTES_DEFAULT = 100000;
+    public static final String KAFKA_ISOLATION_LEVEL = "kafka.isolation.level";
+    public static final String KAFKA_ISOLATION_LEVEL_READ_COMMITTED = "read_committed";
+    public static final String KAFKA_ISOLATION_LEVEL_READ_UNCOMMITTED = "read_uncommitted";
+  }
+
+  public static final String KAFKA_CONSUMER_PROP_PREFIX = "kafka.consumer.prop";
+
+  /// Default value of the Kafka client property `auto.offset.reset`
+  ///
+  /// Pinot always seeks the consumer to an explicit start offset before polling, so this policy takes effect only
+  /// when that offset is no longer in kafka. `earliest` then resumes from the oldest retained record, so
+  /// only the records the broker actually deleted are skipped. Kafka's own default (`latest`) would instead jump to
+  /// the end of the partition log and drop every retained record in between.
+  ///
+  /// This is deliberately independent of the table's initial-offset criteria
+  /// (`stream.<streamType>.consumer.prop.auto.offset.reset`), which only decides where a partition with no prior
+  /// offset starts consuming. To override, set the raw Kafka property `auto.offset.reset` in `streamConfigs`;
+  /// accepted values are Kafka's own (`earliest`, `latest`, `none`).
+  public static final String AUTO_OFFSET_RESET_DEFAULT = "earliest";
+
+  /// Optional comma-separated list of Kafka partition IDs or inclusive ranges to consume
+  /// (e.g. "0,2,5" or "0-399" or "0-99,200,300-399").
+  /// When set, only these partitions are used for the table; when absent, all topic partitions are consumed.
+  /// The total number of unique partition IDs must not exceed 10,000.
+  public static final String PARTITION_IDS = "kafka.partition.ids";
+}

@@ -1,0 +1,937 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pinot.segment.spi.index.metadata;
+
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.Interner;
+import com.google.common.collect.Interners;
+import com.google.common.collect.Maps;
+import it.unimi.dsi.fastutil.ints.IntSet;
+import it.unimi.dsi.fastutil.longs.LongArrayList;
+import java.math.BigDecimal;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+import javax.annotation.Nullable;
+import org.apache.commons.configuration2.Configuration;
+import org.apache.commons.configuration2.PropertiesConfiguration;
+import org.apache.pinot.segment.spi.ColumnMetadata;
+import org.apache.pinot.segment.spi.V1Constants.MetadataKeys.Column;
+import org.apache.pinot.segment.spi.V1Constants.MetadataKeys.Segment;
+import org.apache.pinot.segment.spi.compression.ChunkCompressionType;
+import org.apache.pinot.segment.spi.index.IndexService;
+import org.apache.pinot.segment.spi.index.IndexType;
+import org.apache.pinot.segment.spi.partition.PartitionFunction;
+import org.apache.pinot.segment.spi.partition.PartitionFunctionFactory;
+import org.apache.pinot.segment.spi.partition.metadata.ColumnPartitionMetadata;
+import org.apache.pinot.spi.config.table.FieldConfig.EncodingType;
+import org.apache.pinot.spi.data.ComplexFieldSpec;
+import org.apache.pinot.spi.data.DateTimeFieldSpec;
+import org.apache.pinot.spi.data.DimensionFieldSpec;
+import org.apache.pinot.spi.data.FieldSpec;
+import org.apache.pinot.spi.data.FieldSpec.DataType;
+import org.apache.pinot.spi.data.FieldSpec.FieldType;
+import org.apache.pinot.spi.data.MetricFieldSpec;
+import org.apache.pinot.spi.data.TimeFieldSpec;
+import org.apache.pinot.spi.data.TimeGranularitySpec;
+import org.apache.pinot.spi.env.CommonsConfigurationUtils;
+import org.apache.pinot.spi.utils.BytesUtils;
+import org.apache.pinot.spi.utils.ColumnNameInterner;
+import org.apache.pinot.spi.utils.JsonUtils;
+
+import static com.google.common.base.Preconditions.checkElementIndex;
+
+
+/// Column metadata parsed from `metadata.properties` (or built through [Builder]).
+///
+/// A server retains one instance per (segment, column) for as long as the segment is loaded, so the parse path keeps
+/// the per-column footprint small: column names, parent-column names, date-time formats/granularities and custom
+/// default-null literals are interned (they recur in every segment of a table), and a `defaultNullValue` that equals
+/// the type default is not handed to the [FieldSpec] at all, so the spec carries the shared static
+/// `FieldSpec.DEFAULT_*` constant and never retains the literal. The [FieldSpec] itself is then interned through
+/// [#FIELD_SPEC_INTERNER], so every segment of a table (and every table with an identical column definition) shares
+/// one instance per distinct spec instead of retaining its own. Callers must treat shared specs and their nested
+/// values as read-only. Deserialize [FieldSpec#toJsonObject()] to make a copy before editing a spec.
+@SuppressWarnings({"rawtypes", "unchecked"})
+public class ColumnMetadataImpl implements ColumnMetadata {
+  private static final long SIZE_MASK = 0xffffffffffffL;
+
+  /// Canonical instances of the [FieldSpec]s parsed from `metadata.properties`, keyed by [FieldSpec#equals] /
+  /// [FieldSpec#hashCode] (name, data type, single-value, default null value, max length, date-time format and
+  /// granularity, ...), so schema evolution yields a distinct canonical instance per version of a column. The specs
+  /// are held weakly: the canonical instance is exactly the one the loaded segments retain, so it lives as long as
+  /// any of them and is released once the last one is unloaded. Thread-safe.
+  private static final Interner<FieldSpec> FIELD_SPEC_INTERNER = Interners.newWeakInterner();
+  private static final Interner<String> DEFAULT_NULL_VALUE_INTERNER = Interners.newWeakInterner();
+
+  private final FieldSpec _fieldSpec;
+  private final int _totalDocs;
+  private final int _cardinality;
+  private final boolean _hasDictionary;
+  private final EncodingType _forwardIndexEncoding;
+  private final boolean _sorted;
+  private final boolean _nonNull;
+  private final Comparable _minValue;
+  private final Comparable _maxValue;
+  private final boolean _minMaxValueInvalid;
+  private final int _lengthOfShortestElement;
+  private final int _lengthOfLongestElement;
+  private final boolean _isAscii;
+  private final int _totalNumberOfEntries;
+  private final int _maxNumberOfMultiValues;
+  private final int _maxRowLengthInBytes;
+  private final int _bitsPerElement;
+  private final PartitionFunction _partitionFunction;
+  private final Set<Integer> _partitions;
+  private final boolean _autoGenerated;
+  @Nullable
+  private final String _parentColumn;
+  @Nullable
+  private final List<String> _sparseKeys;
+  @Nullable
+  private final CompressionMetadata _compressionMetadata;
+
+  /// Packed index sizes: the high 16 bits identify the index type and the low 48 bits hold its size.
+  /// Allocated on the first valid append and populated before publication. Not thread-safe.
+  @Nullable
+  private LongArrayList _indexTypeSizes;
+
+  private ColumnMetadataImpl(FieldSpec fieldSpec, int totalDocs, int cardinality, boolean hasDictionary,
+      @Nullable EncodingType forwardIndexEncoding, boolean sorted, boolean nonNull, @Nullable Comparable minValue,
+      @Nullable Comparable maxValue,
+      boolean minMaxValueInvalid, int lengthOfShortestElement, int lengthOfLongestElement, boolean isAscii,
+      int totalNumberOfEntries, int maxNumberOfMultiValues, int maxRowLengthInBytes, int bitsPerElement,
+      @Nullable PartitionFunction partitionFunction, @Nullable Set<Integer> partitions, boolean autoGenerated,
+      @Nullable String parentColumn, @Nullable List<String> sparseKeys,
+      @Nullable CompressionMetadata compressionMetadata) {
+    _fieldSpec = fieldSpec;
+    _totalDocs = totalDocs;
+    _cardinality = cardinality;
+    _hasDictionary = hasDictionary;
+    _forwardIndexEncoding = forwardIndexEncoding;
+    _sorted = sorted;
+    _nonNull = nonNull;
+    _minValue = minValue;
+    _maxValue = maxValue;
+    _minMaxValueInvalid = minMaxValueInvalid;
+    _lengthOfShortestElement = lengthOfShortestElement;
+    _lengthOfLongestElement = lengthOfLongestElement;
+    _isAscii = isAscii;
+    _bitsPerElement = bitsPerElement;
+    _totalNumberOfEntries = totalNumberOfEntries;
+    _maxNumberOfMultiValues = maxNumberOfMultiValues;
+    _maxRowLengthInBytes = maxRowLengthInBytes;
+    _partitionFunction = partitionFunction;
+    _partitions = partitions;
+    _autoGenerated = autoGenerated;
+    _parentColumn = parentColumn;
+    _sparseKeys = sparseKeys;
+    _compressionMetadata = compressionMetadata;
+  }
+
+  @Override
+  public FieldSpec getFieldSpec() {
+    return _fieldSpec;
+  }
+
+  @Override
+  public int getTotalDocs() {
+    return _totalDocs;
+  }
+
+  @Override
+  public int getCardinality() {
+    return _cardinality;
+  }
+
+  @Override
+  public boolean hasDictionary() {
+    return _hasDictionary;
+  }
+
+  @Override
+  public EncodingType getForwardIndexEncoding() {
+    return _forwardIndexEncoding;
+  }
+
+  @Override
+  public boolean isSorted() {
+    return _sorted;
+  }
+
+  @Override
+  public boolean isNonNull() {
+    return _nonNull;
+  }
+
+  @Nullable
+  @Override
+  public Comparable<?> getMinValue() {
+    return _minValue;
+  }
+
+  @Nullable
+  @Override
+  public Comparable<?> getMaxValue() {
+    return _maxValue;
+  }
+
+  @Override
+  public boolean isMinMaxValueInvalid() {
+    return _minMaxValueInvalid;
+  }
+
+  @Override
+  public int getLengthOfShortestElement() {
+    return _lengthOfShortestElement;
+  }
+
+  @Override
+  public int getLengthOfLongestElement() {
+    return _lengthOfLongestElement;
+  }
+
+  @Override
+  public boolean isAscii() {
+    return _isAscii;
+  }
+
+  @Override
+  public int getBitsPerElement() {
+    return _bitsPerElement;
+  }
+
+  @Override
+  public int getTotalNumberOfEntries() {
+    return _totalNumberOfEntries;
+  }
+
+  @Override
+  public int getMaxNumberOfMultiValues() {
+    return _maxNumberOfMultiValues;
+  }
+
+  @Override
+  public int getMaxRowLengthInBytes() {
+    return _maxRowLengthInBytes;
+  }
+
+  @Nullable
+  @Override
+  public PartitionFunction getPartitionFunction() {
+    return _partitionFunction;
+  }
+
+  @Nullable
+  @Override
+  public Set<Integer> getPartitions() {
+    return _partitions;
+  }
+
+  @Override
+  public boolean isAutoGenerated() {
+    return _autoGenerated;
+  }
+
+  /// Returns `true` if this column is a materialized column produced from an OPEN_STRUCT parent column.
+  public boolean isMaterializedChild() {
+    return _parentColumn != null;
+  }
+
+  /// Returns the name of the parent OPEN_STRUCT column, or `null` if this is not a materialized column.
+  @Nullable
+  public String getParentColumn() {
+    return _parentColumn;
+  }
+
+  /// Names of the keys in this OPEN_STRUCT column's sparse blob, or null when unknown
+  /// (segment predates the manifest). Only set on OPEN_STRUCT parent columns.
+  @Nullable
+  public List<String> getSparseKeys() {
+    return _sparseKeys;
+  }
+
+  @Override
+  public long getIndexSizeFor(IndexType type) {
+    if (_indexTypeSizes == null) {
+      return UNAVAILABLE;
+    }
+    short indexId = IndexService.getInstance().getNumericId(type);
+    for (int i = 0; i < _indexTypeSizes.size(); i++) {
+      long typeAndSize = _indexTypeSizes.getLong(i);
+      if (indexId == unpackIndexType(typeAndSize)) {
+        return unpackIndexSize(typeAndSize);
+      }
+    }
+    return UNAVAILABLE;
+  }
+
+  // size should be non-negative 48-bit value
+  public void addIndexSize(short indexType, long size) {
+    if (size < 0 || size > SIZE_MASK) {
+      throw new IllegalArgumentException(
+          "Index size should be a non-negative integer value between 0 and " + SIZE_MASK);
+    }
+    long typeAndSize = ((long) indexType) << 48 | (size & SIZE_MASK);
+    if (_indexTypeSizes == null) {
+      _indexTypeSizes = new LongArrayList(2);
+    }
+    _indexTypeSizes.add(typeAndSize);
+  }
+
+  @Override
+  public int getNumIndexes() {
+    return _indexTypeSizes == null ? 0 : _indexTypeSizes.size();
+  }
+
+  @Override
+  public short getIndexType(int position) {
+    checkElementIndex(position, getNumIndexes());
+    return unpackIndexType(_indexTypeSizes.getLong(position));
+  }
+
+  private static short unpackIndexType(long typeAndSize) {
+    return (short) ((typeAndSize >>> 48));
+  }
+
+  @Override
+  public long getIndexSize(int position) {
+    checkElementIndex(position, getNumIndexes());
+    return unpackIndexSize(_indexTypeSizes.getLong(position));
+  }
+
+  private static long unpackIndexSize(long typeAndSize) {
+    return typeAndSize & SIZE_MASK;
+  }
+
+  @Override
+  public long getRawForwardIndexUncompressedValueSizeInBytes() {
+    return _compressionMetadata != null ? _compressionMetadata._uncompressedValueSizeInBytes : UNAVAILABLE;
+  }
+
+  @Nullable
+  @Override
+  public ChunkCompressionType getRawForwardIndexChunkCompressionType() {
+    return _compressionMetadata != null ? _compressionMetadata._forwardIndexChunkCompressionType : null;
+  }
+
+  @Override
+  public long getDictionaryEncodedUncompressedValueSizeInBytes() {
+    return _compressionMetadata != null ? _compressionMetadata._dictionaryUncompressedValueSizeInBytes : UNAVAILABLE;
+  }
+
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) {
+      return true;
+    }
+    if (o == null || getClass() != o.getClass()) {
+      return false;
+    }
+    ColumnMetadataImpl that = (ColumnMetadataImpl) o;
+    return _totalDocs == that._totalDocs
+        && _cardinality == that._cardinality
+        && _hasDictionary == that._hasDictionary
+        && _forwardIndexEncoding == that._forwardIndexEncoding
+        && _sorted == that._sorted && _nonNull == that._nonNull
+        && _minMaxValueInvalid == that._minMaxValueInvalid
+        && _lengthOfShortestElement == that._lengthOfShortestElement
+        && _lengthOfLongestElement == that._lengthOfLongestElement
+        && _isAscii == that._isAscii
+        && _totalNumberOfEntries == that._totalNumberOfEntries
+        && _maxNumberOfMultiValues == that._maxNumberOfMultiValues
+        && _maxRowLengthInBytes == that._maxRowLengthInBytes
+        && _bitsPerElement == that._bitsPerElement
+        && _autoGenerated == that._autoGenerated
+        && Objects.equals(_fieldSpec, that._fieldSpec)
+        && Objects.equals(_minValue, that._minValue)
+        && Objects.equals(_maxValue, that._maxValue)
+        && Objects.equals(_partitionFunction, that._partitionFunction)
+        && Objects.equals(_partitions, that._partitions)
+        && Objects.equals(_parentColumn, that._parentColumn)
+        && Objects.equals(_sparseKeys, that._sparseKeys)
+        && Objects.equals(_compressionMetadata, that._compressionMetadata)
+        && Objects.equals(_indexTypeSizes, that._indexTypeSizes);
+  }
+
+  @Override
+  public int hashCode() {
+    return Objects.hash(_fieldSpec, _totalDocs, _cardinality, _hasDictionary, _forwardIndexEncoding, _sorted, _nonNull,
+        _minValue, _maxValue, _minMaxValueInvalid, _lengthOfShortestElement, _lengthOfLongestElement, _isAscii,
+        _totalNumberOfEntries, _maxNumberOfMultiValues, _maxRowLengthInBytes, _bitsPerElement, _partitionFunction,
+        _partitions, _autoGenerated, _parentColumn, _sparseKeys, _compressionMetadata,
+        _indexTypeSizes);
+  }
+
+  @Override
+  public String toString() {
+    return "ColumnMetadataImpl{"
+        + "_fieldSpec=" + _fieldSpec
+        + ", _totalDocs=" + _totalDocs
+        + ", _cardinality=" + _cardinality
+        + ", _hasDictionary=" + _hasDictionary
+        + ", _forwardIndexEncoding=" + _forwardIndexEncoding
+        + ", _sorted=" + _sorted + ", _nonNull=" + _nonNull
+        + ", _minValue=" + _minValue
+        + ", _maxValue=" + _maxValue
+        + ", _minMaxValueInvalid=" + _minMaxValueInvalid
+        + ", _lengthOfShortestElement=" + _lengthOfShortestElement
+        + ", _lengthOfLongestElement=" + _lengthOfLongestElement
+        + ", _isAscii=" + _isAscii
+        + ", _totalNumberOfEntries=" + _totalNumberOfEntries
+        + ", _maxNumberOfMultiValues=" + _maxNumberOfMultiValues
+        + ", _maxRowLengthInBytes=" + _maxRowLengthInBytes
+        + ", _bitsPerElement=" + _bitsPerElement
+        + ", _partitionFunction=" + _partitionFunction
+        + ", _partitions=" + _partitions
+        + ", _autoGenerated=" + _autoGenerated
+        + ", _parentColumn=" + _parentColumn
+        + ", _sparseKeys=" + _sparseKeys
+        + ", _compressionMetadata=" + _compressionMetadata
+        + ", _indexTypeSizes=" + _indexTypeSizes
+        + '}';
+  }
+
+  public static ColumnMetadataImpl fromPropertiesConfiguration(PropertiesConfiguration config, int totalDocs,
+      String column) {
+    FieldSpec fieldSpec = extractFieldSpec(column, config);
+    Builder builder = new Builder()
+        .setFieldSpec(fieldSpec)
+        .setTotalDocs(totalDocs)
+        .setCardinality(config.getInt(Column.getKeyFor(column, Column.CARDINALITY)))
+        .setHasDictionary(config.getBoolean(Column.getKeyFor(column, Column.HAS_DICTIONARY), true))
+        .setForwardIndexEncoding(
+            config.getEnum(Column.getKeyFor(column, Column.FORWARD_INDEX_ENCODING), EncodingType.class, null))
+        .setSorted(config.getBoolean(Column.getKeyFor(column, Column.IS_SORTED), false))
+        .setNonNull(config.getBoolean(Column.getKeyFor(column, Column.IS_NON_NULL), false))
+        .setLengthOfShortestElement(
+            config.getInt(Column.getKeyFor(column, Column.LENGTH_OF_SHORTEST_ELEMENT), UNAVAILABLE))
+        .setLengthOfLongestElement(
+            config.getInt(Column.getKeyFor(column, Column.LENGTH_OF_LONGEST_ELEMENT), UNAVAILABLE))
+        .setDictionaryElementSize(config.getInt(Column.getKeyFor(column, Column.DICTIONARY_ELEMENT_SIZE), UNAVAILABLE))
+        .setAscii(config.getBoolean(Column.getKeyFor(column, Column.IS_ASCII), false))
+        .setTotalNumberOfEntries(config.getInt(Column.getKeyFor(column, Column.TOTAL_NUMBER_OF_ENTRIES), UNAVAILABLE))
+        .setMaxNumberOfMultiValues(
+            config.getInt(Column.getKeyFor(column, Column.MAX_MULTI_VALUE_ELEMENTS), UNAVAILABLE))
+        .setMaxRowLengthInBytes(config.getInt(Column.getKeyFor(column, Column.MAX_ROW_LENGTH_IN_BYTES), UNAVAILABLE))
+        .setBitsPerElement(config.getInt(Column.getKeyFor(column, Column.BITS_PER_ELEMENT), UNAVAILABLE))
+        .setAutoGenerated(config.getBoolean(Column.getKeyFor(column, Column.IS_AUTO_GENERATED), false))
+        .setParentColumn(
+            ColumnNameInterner.intern(config.getString(Column.getKeyFor(column, Column.PARENT_COLUMN), null)));
+
+    Object rawSparseKeys = config.getProperty(Column.getKeyFor(column, Column.SPARSE_KEYS));
+    if (rawSparseKeys != null) {
+      // The value is a JSON array string, but LegacyListDelimiterHandler splits on commas,
+      // fragmenting it into a List. Rejoin before parsing.
+      String jsonStr = rawSparseKeys instanceof List
+          ? ((List<?>) rawSparseKeys).stream().map(String::valueOf).collect(Collectors.joining(","))
+          : rawSparseKeys.toString();
+      try {
+        List<String> sparseKeys = JsonUtils.stringToObject(jsonStr, new TypeReference<List<String>>() { });
+        builder.setSparseKeys(sparseKeys);
+      } catch (Exception e) {
+        throw new RuntimeException("Failed to parse sparse-key manifest: " + jsonStr, e);
+      }
+    }
+
+    // Set min/max value
+    DataType storedType = fieldSpec.getDataType().getStoredType();
+    if (fieldSpec instanceof ComplexFieldSpec) {
+      // Complex field does not have min/max value
+      builder.setMinMaxValueInvalid(true);
+    } else {
+      // Set min/max value if available
+      // NOTE: Use getProperty() instead of getString() to avoid variable substitution ('${anotherKey}'), which can
+      //       cause problem for special values such as '$${' where the first '$' is identified as escape character.
+      // TODO: Use getProperty() for other properties as well to avoid the overhead of variable substitution
+      String minString = (String) config.getProperty(Column.getKeyFor(column, Column.MIN_VALUE));
+      String maxString = (String) config.getProperty(Column.getKeyFor(column, Column.MAX_VALUE));
+      // Set min/max value if available
+      if (minString != null) {
+        builder.setMinValue(parseValue(storedType, column, minString));
+      }
+      if (maxString != null) {
+        builder.setMaxValue(parseValue(storedType, column, maxString));
+      }
+      if (minString == null && maxString == null) {
+        builder.setMinMaxValueInvalid(config.getBoolean(Column.getKeyFor(column, Column.MIN_MAX_VALUE_INVALID), false));
+      }
+    }
+
+    // Set partition function
+    PartitionFunction partitionFunction = extractPartitionFunction(column, config);
+    if (partitionFunction != null) {
+      builder.setPartitionFunction(partitionFunction);
+      builder.setPartitions(extractPartitions(column, config));
+    }
+
+    // Read compression stats if available
+    builder.setRawForwardIndexUncompressedValueSizeInBytes(
+        config.getLong(Column.getKeyFor(column, Column.FORWARD_INDEX_RAW_UNCOMPRESSED_VALUE_SIZE_IN_BYTES),
+            UNAVAILABLE));
+    builder.setRawForwardIndexChunkCompressionType(
+        parseCompressionType(column,
+            config.getString(Column.getKeyFor(column, Column.FORWARD_INDEX_RAW_CHUNK_COMPRESSION_TYPE), null)));
+    builder.setDictionaryEncodedUncompressedValueSizeInBytes(
+        config.getLong(
+            Column.getKeyFor(column, Column.FORWARD_INDEX_DICTIONARY_ENCODED_UNCOMPRESSED_VALUE_SIZE_IN_BYTES),
+            UNAVAILABLE));
+
+    return builder.build();
+  }
+
+  @Nullable
+  private static ChunkCompressionType parseCompressionType(String column, @Nullable String value) {
+    if (value == null) {
+      return null;
+    }
+    try {
+      return ChunkCompressionType.valueOf(value);
+    } catch (IllegalArgumentException e) {
+      throw new IllegalStateException("Invalid forward-index chunk compression type '" + value
+          + "' in metadata for column '" + column + "'", e);
+    }
+  }
+
+  /// Parses the [FieldSpec] of the given column. DIMENSION, METRIC, TIME and DATE_TIME specs are returned from
+  /// [#FIELD_SPEC_INTERNER], so the instance is shared with every other segment whose column parses to an equal spec
+  /// and must not be mutated. A COMPLEX spec retains its own mutable child map and is not interned; its children
+  /// are parsed through this method and are interned.
+  @SuppressWarnings("deprecation") // Preserve the field type when loading legacy TIME column metadata.
+  public static FieldSpec extractFieldSpec(String column, PropertiesConfiguration config) {
+    // The name is retained by the FieldSpec, the segment Schema and every per-segment column map, and it recurs in
+    // every segment of the table: share it through the column-name interner. When COLUMN_NAME is absent
+    // (the segment creator only writes it when it differs from the key) this is the key parsed by SegmentMetadataImpl,
+    // which is already interned, so the lookup just returns it.
+    String fieldName =
+        ColumnNameInterner.intern(config.getString(Column.getKeyFor(column, Column.COLUMN_NAME), column));
+    FieldType fieldType = config.getEnum(Column.getKeyFor(column, Column.COLUMN_TYPE), FieldType.class);
+    DataType dataType = config.getEnum(Column.getKeyFor(column, Column.DATA_TYPE), DataType.class);
+    boolean isSingleValue = config.getBoolean(Column.getKeyFor(column, Column.IS_SINGLE_VALUED), true);
+    String defaultNullValueString = config.getString(Column.getKeyFor(column, Column.DEFAULT_NULL_VALUE), null);
+    if (defaultNullValueString != null && dataType.getStoredType() == DataType.STRING) {
+      defaultNullValueString = CommonsConfigurationUtils.recoverSpecialCharacterInPropertyValue(defaultNullValueString);
+    }
+    Integer maxLength = config.getInteger(Column.getKeyFor(column, Column.SCHEMA_MAX_LENGTH), null);
+    String maxLengthExceedStrategyString =
+        config.getString(Column.getKeyFor(column, Column.SCHEMA_MAX_LENGTH_EXCEED_STRATEGY), null);
+    FieldSpec.MaxLengthExceedStrategy maxLengthExceedStrategy = maxLengthExceedStrategyString != null
+        ? FieldSpec.MaxLengthExceedStrategy.valueOf(maxLengthExceedStrategyString) : null;
+    switch (fieldType) {
+      case DIMENSION:
+        return FIELD_SPEC_INTERNER.intern(new DimensionFieldSpec(fieldName, dataType, isSingleValue, maxLength,
+            canonicalDefaultNullValue(fieldType, dataType, defaultNullValueString), maxLengthExceedStrategy));
+      case METRIC:
+        return FIELD_SPEC_INTERNER.intern(new MetricFieldSpec(fieldName, dataType,
+            canonicalDefaultNullValue(fieldType, dataType, defaultNullValueString), maxLength,
+            maxLengthExceedStrategy));
+      case TIME:
+        TimeUnit timeUnit = TimeUnit.valueOf(config.getString(Segment.TIME_UNIT, "DAYS").toUpperCase());
+        return FIELD_SPEC_INTERNER.intern(new TimeFieldSpec(new TimeGranularitySpec(dataType, timeUnit, fieldName)));
+      case DATE_TIME:
+        String format = intern(config.getString(Column.getKeyFor(column, Column.DATETIME_FORMAT)));
+        String granularity = intern(config.getString(Column.getKeyFor(column, Column.DATETIME_GRANULARITY)));
+        return FIELD_SPEC_INTERNER.intern(new DateTimeFieldSpec(fieldName, dataType, format, granularity,
+            canonicalDefaultNullValue(fieldType, dataType, defaultNullValueString), null));
+      case COMPLEX:
+        List<String> childFieldNames =
+            config.getList(String.class, Column.getKeyFor(column, Column.COMPLEX_CHILD_FIELD_NAMES));
+        Map<String, FieldSpec> childFieldSpecs = new HashMap<>();
+        if (childFieldNames != null) {
+          for (String childField : childFieldNames) {
+            childFieldSpecs.put(ColumnNameInterner.intern(childField),
+                extractFieldSpec(ComplexFieldSpec.getFullChildName(column, childField), config));
+          }
+        }
+        // Deliberately not interned (see the method doc): only the children above are shared.
+        return new ComplexFieldSpec(fieldName, dataType, true, childFieldSpecs);
+      default:
+        throw new IllegalStateException("Unsupported field type: " + fieldType);
+    }
+  }
+
+  /// Returns the `defaultNullValue` literal to hand to the [FieldSpec] constructor: `null` when the literal parses to
+  /// the type default, so the spec ends up holding the shared static `FieldSpec.DEFAULT_*` constant instead of a
+  /// per-segment box plus the literal (the segment creator writes the literal for every column, so without this every
+  /// column of every segment paid for it); otherwise the interned literal, so a custom default is shared across the
+  /// segments of the table. Equality is [DataType#equals(Object, Object)], the predicate [FieldSpec#equals] applies to
+  /// default null values, so the canonical spec equals one built from the literal and
+  /// [FieldSpec#getDefaultNullValueString()] (derived from the value) is unchanged; a BIG_DECIMAL literal with a
+  /// different scale or a negative-zero FLOAT/DOUBLE is not equal and stays verbatim.
+  @VisibleForTesting
+  @Nullable
+  static String canonicalDefaultNullValue(FieldType fieldType, DataType dataType, @Nullable String literal) {
+    if (literal == null) {
+      return null;
+    }
+    Object typeDefault;
+    try {
+      typeDefault = FieldSpec.getDefaultNullValue(fieldType, dataType, null);
+    } catch (IllegalStateException e) {
+      // No type default for this combination (e.g. a METRIC BOOLEAN): the literal is the only valid value, exactly as
+      // the FieldSpec constructor treats it.
+      return DEFAULT_NULL_VALUE_INTERNER.intern(literal);
+    }
+    return dataType.equals(FieldSpec.getDefaultNullValue(fieldType, dataType, literal), typeDefault) ? null
+        : DEFAULT_NULL_VALUE_INTERNER.intern(literal);
+  }
+
+  @Nullable
+  private static String intern(@Nullable String value) {
+    return value != null ? value.intern() : null;
+  }
+
+  @Nullable
+  public static PartitionFunction extractPartitionFunction(String column, PropertiesConfiguration config) {
+    String partitionFunctionName = config.getString(Column.getKeyFor(column, Column.PARTITION_FUNCTION), null);
+    if (partitionFunctionName == null) {
+      return null;
+    }
+    int numPartitions = config.getInt(Column.getKeyFor(column, Column.NUM_PARTITIONS));
+    Configuration partitionFunctionConfig = config.subset(Column.getKeyFor(column, Column.PARTITION_FUNCTION_CONFIG));
+    Map<String, String> partitionFunctionConfigMap;
+    if (!partitionFunctionConfig.isEmpty()) {
+      partitionFunctionConfigMap = new HashMap<>();
+      partitionFunctionConfig.forEach((k, v) -> {
+        // NOTE:
+        // A partition function config value can have comma and this value is read as a List from
+        // PropertiesConfiguration.getProperty, hence we need to rebuild original comma separated string value from
+        // this list of values.
+        partitionFunctionConfigMap.put(k, v instanceof List ? String.join(",", (List) v) : v.toString());
+      });
+    } else {
+      partitionFunctionConfigMap = null;
+    }
+    return PartitionFunctionFactory.getPartitionFunction(partitionFunctionName, numPartitions,
+        partitionFunctionConfigMap);
+  }
+
+  public static IntSet extractPartitions(String column, PropertiesConfiguration config) {
+    return ColumnPartitionMetadata.extractPartitions(config.getList(Column.getKeyFor(column, Column.PARTITION_VALUES)));
+  }
+
+  private static Comparable parseValue(DataType storedType, String column, String valueString) {
+    switch (storedType) {
+      case INT:
+        return Integer.valueOf(valueString);
+      case LONG:
+        return Long.valueOf(valueString);
+      case FLOAT:
+        return Float.valueOf(valueString);
+      case DOUBLE:
+        return Double.valueOf(valueString);
+      case BIG_DECIMAL:
+        return new BigDecimal(valueString);
+      case STRING:
+        return CommonsConfigurationUtils.recoverSpecialCharacterInPropertyValue(valueString);
+      case BYTES:
+        return BytesUtils.toByteArray(valueString);
+      default:
+        throw new IllegalStateException("Unsupported data type: " + storedType + " for column: " + column);
+    }
+  }
+
+  // NOTE: This method is only meant to retain compatibility of serialization for endpoint:
+  //       `/tables/{tableName}/segments/{segmentName}/metadata`
+  @SuppressWarnings("unused")
+  public Map<IndexType<?, ?, ?>, Long> getIndexSizeMap() {
+    if (_indexTypeSizes == null) {
+      return new HashMap<>();
+    }
+    IndexService service = IndexService.getInstance();
+    Map<IndexType<?, ?, ?>, Long> result = Maps.newHashMapWithExpectedSize(_indexTypeSizes.size());
+    for (int i = 0; i < _indexTypeSizes.size(); i++) {
+      long typeAndSize = _indexTypeSizes.getLong(i);
+      short type = unpackIndexType(typeAndSize);
+      long size = unpackIndexSize(typeAndSize);
+      result.put(service.get(type), size);
+    }
+    return result;
+  }
+
+  public static Builder builder() {
+    return new Builder();
+  }
+
+  private static final class CompressionMetadata {
+    private final long _uncompressedValueSizeInBytes;
+    @Nullable
+    private final ChunkCompressionType _forwardIndexChunkCompressionType;
+    private final long _dictionaryUncompressedValueSizeInBytes;
+
+    private CompressionMetadata(long uncompressedValueSizeInBytes,
+        @Nullable ChunkCompressionType forwardIndexChunkCompressionType,
+        long dictionaryUncompressedValueSizeInBytes) {
+      _uncompressedValueSizeInBytes = uncompressedValueSizeInBytes;
+      _forwardIndexChunkCompressionType = forwardIndexChunkCompressionType;
+      _dictionaryUncompressedValueSizeInBytes = dictionaryUncompressedValueSizeInBytes;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      if (this == o) {
+        return true;
+      }
+      if (o == null || getClass() != o.getClass()) {
+        return false;
+      }
+      CompressionMetadata that = (CompressionMetadata) o;
+      return _uncompressedValueSizeInBytes == that._uncompressedValueSizeInBytes
+          && _forwardIndexChunkCompressionType == that._forwardIndexChunkCompressionType
+          && _dictionaryUncompressedValueSizeInBytes == that._dictionaryUncompressedValueSizeInBytes;
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(_uncompressedValueSizeInBytes, _forwardIndexChunkCompressionType,
+          _dictionaryUncompressedValueSizeInBytes);
+    }
+
+    @Override
+    public String toString() {
+      return "CompressionMetadata{"
+          + "_uncompressedValueSizeInBytes=" + _uncompressedValueSizeInBytes
+          + ", _forwardIndexChunkCompressionType=" + _forwardIndexChunkCompressionType
+          + ", _dictionaryUncompressedValueSizeInBytes=" + _dictionaryUncompressedValueSizeInBytes
+          + '}';
+    }
+
+    @Nullable
+    private static CompressionMetadata create(long uncompressedValueSizeInBytes,
+        @Nullable ChunkCompressionType forwardIndexChunkCompressionType,
+        long dictionaryUncompressedValueSizeInBytes) {
+      return uncompressedValueSizeInBytes == UNAVAILABLE && forwardIndexChunkCompressionType == null
+          && dictionaryUncompressedValueSizeInBytes == UNAVAILABLE ? null
+          : new CompressionMetadata(uncompressedValueSizeInBytes, forwardIndexChunkCompressionType,
+              dictionaryUncompressedValueSizeInBytes);
+    }
+  }
+
+  public static class Builder {
+    private FieldSpec _fieldSpec;
+    private int _totalDocs;
+    private int _cardinality;
+    private boolean _hasDictionary;
+    private EncodingType _forwardIndexEncoding;
+    private boolean _sorted;
+    private boolean _nonNull;
+    private Comparable<?> _minValue;
+    private Comparable<?> _maxValue;
+    private boolean _minMaxValueInvalid;
+    private int _lengthOfShortestElement;
+    private int _lengthOfLongestElement;
+    private int _dictionaryElementSize;
+    private boolean _isAscii;
+    private int _totalNumberOfEntries;
+    private int _maxNumberOfMultiValues;
+    private int _maxRowLengthInBytes;
+    private int _bitsPerElement;
+    private PartitionFunction _partitionFunction;
+    private Set<Integer> _partitions;
+    private boolean _autoGenerated;
+    private String _parentColumn;
+    private List<String> _sparseKeys;
+    private long _uncompressedValueSizeInBytes = UNAVAILABLE;
+    private ChunkCompressionType _forwardIndexChunkCompressionType;
+    private long _dictionaryUncompressedValueSizeInBytes = UNAVAILABLE;
+
+    public Builder setFieldSpec(FieldSpec fieldSpec) {
+      _fieldSpec = fieldSpec;
+      return this;
+    }
+
+    public Builder setTotalDocs(int totalDocs) {
+      _totalDocs = totalDocs;
+      return this;
+    }
+
+    public Builder setCardinality(int cardinality) {
+      _cardinality = cardinality;
+      return this;
+    }
+
+    public Builder setHasDictionary(boolean hasDictionary) {
+      _hasDictionary = hasDictionary;
+      return this;
+    }
+
+    public Builder setForwardIndexEncoding(EncodingType forwardIndexEncoding) {
+      _forwardIndexEncoding = forwardIndexEncoding;
+      return this;
+    }
+
+    public Builder setSorted(boolean sorted) {
+      _sorted = sorted;
+      return this;
+    }
+
+    public Builder setNonNull(boolean nonNull) {
+      _nonNull = nonNull;
+      return this;
+    }
+
+    public Builder setMinValue(Comparable<?> minValue) {
+      _minValue = minValue;
+      return this;
+    }
+
+    public Builder setMaxValue(Comparable<?> maxValue) {
+      _maxValue = maxValue;
+      return this;
+    }
+
+    public Builder setMinMaxValueInvalid(boolean minMaxValueInvalid) {
+      _minMaxValueInvalid = minMaxValueInvalid;
+      return this;
+    }
+
+    public Builder setLengthOfShortestElement(int lengthOfShortestElement) {
+      _lengthOfShortestElement = lengthOfShortestElement;
+      return this;
+    }
+
+    public Builder setLengthOfLongestElement(int lengthOfLongestElement) {
+      _lengthOfLongestElement = lengthOfLongestElement;
+      return this;
+    }
+
+    public Builder setDictionaryElementSize(int dictionaryElementSize) {
+      _dictionaryElementSize = dictionaryElementSize;
+      return this;
+    }
+
+    public Builder setAscii(boolean isAscii) {
+      _isAscii = isAscii;
+      return this;
+    }
+
+    public Builder setTotalNumberOfEntries(int totalNumberOfEntries) {
+      _totalNumberOfEntries = totalNumberOfEntries;
+      return this;
+    }
+
+    public Builder setMaxNumberOfMultiValues(int maxNumberOfMultiValues) {
+      _maxNumberOfMultiValues = maxNumberOfMultiValues;
+      return this;
+    }
+
+    public Builder setMaxRowLengthInBytes(int maxRowLengthInBytes) {
+      _maxRowLengthInBytes = maxRowLengthInBytes;
+      return this;
+    }
+
+    public Builder setBitsPerElement(int bitsPerElement) {
+      _bitsPerElement = bitsPerElement;
+      return this;
+    }
+
+    public Builder setPartitionFunction(PartitionFunction partitionFunction) {
+      _partitionFunction = partitionFunction;
+      return this;
+    }
+
+    public Builder setPartitions(Set<Integer> partitions) {
+      _partitions = partitions;
+      return this;
+    }
+
+    public Builder setAutoGenerated(boolean autoGenerated) {
+      _autoGenerated = autoGenerated;
+      return this;
+    }
+
+    public Builder setParentColumn(String parentColumn) {
+      _parentColumn = parentColumn;
+      return this;
+    }
+
+    public Builder setSparseKeys(List<String> sparseKeys) {
+      _sparseKeys = sparseKeys;
+      return this;
+    }
+
+    /// Sets the uncompressed bytes represented by a raw forward index.
+    public Builder setRawForwardIndexUncompressedValueSizeInBytes(long uncompressedValueSizeInBytes) {
+      _uncompressedValueSizeInBytes = uncompressedValueSizeInBytes;
+      return this;
+    }
+
+    /// Sets the chunk compression type persisted for a raw forward index.
+    public Builder setRawForwardIndexChunkCompressionType(
+        @Nullable ChunkCompressionType forwardIndexChunkCompressionType) {
+      _forwardIndexChunkCompressionType = forwardIndexChunkCompressionType;
+      return this;
+    }
+
+    /// Sets the uncompressed serialized column-value bytes represented by a dictionary-encoded column.
+    public Builder setDictionaryEncodedUncompressedValueSizeInBytes(long dictionaryUncompressedValueSizeInBytes) {
+      _dictionaryUncompressedValueSizeInBytes = dictionaryUncompressedValueSizeInBytes;
+      return this;
+    }
+
+    public ColumnMetadataImpl build() {
+      // Canonicalize forward index encoding
+      if (_forwardIndexEncoding == null) {
+        _forwardIndexEncoding = _hasDictionary ? EncodingType.DICTIONARY : EncodingType.RAW;
+      }
+
+      // Canonicalize length of shortest/longest element
+      DataType storedType = _fieldSpec.getDataType().getStoredType();
+      if (storedType.isFixedWidth()) {
+        int size = storedType.size();
+        _lengthOfShortestElement = size;
+        _lengthOfLongestElement = size;
+      } else {
+        // Pre-1.6.0 segments don't write LENGTH_OF_LONGEST_ELEMENT; fall back to DICTIONARY_ELEMENT_SIZE,
+        // which has been written for dictionary-encoded columns since well before 1.6.0 (including the
+        // zero-length case where every entry is an empty string). Leaving the field at the UNAVAILABLE
+        // sentinel would propagate as `numBytesPerValue = -1` into BaseImmutableDictionary.getBuffer().
+        if (_lengthOfLongestElement < 0 && _hasDictionary) {
+          _lengthOfLongestElement = _dictionaryElementSize;
+        }
+      }
+
+      // Canonicalize MV related fields
+      if (_fieldSpec.isSingleValueField()) {
+        _totalNumberOfEntries = _totalDocs;
+        _maxNumberOfMultiValues = 0;
+        _maxRowLengthInBytes = _lengthOfLongestElement;
+      } else if (storedType.isFixedWidth()) {
+        _maxRowLengthInBytes = _maxNumberOfMultiValues * storedType.size();
+      }
+
+      // Canonicalize bits per element
+      if (!_hasDictionary) {
+        _bitsPerElement = UNAVAILABLE;
+      }
+
+      return new ColumnMetadataImpl(_fieldSpec, _totalDocs, _cardinality, _hasDictionary, _forwardIndexEncoding,
+          _sorted, _nonNull, _minValue, _maxValue, _minMaxValueInvalid, _lengthOfShortestElement,
+          _lengthOfLongestElement, _isAscii, _totalNumberOfEntries, _maxNumberOfMultiValues, _maxRowLengthInBytes,
+          _bitsPerElement, _partitionFunction, _partitions, _autoGenerated, _parentColumn, _sparseKeys,
+          CompressionMetadata.create(_uncompressedValueSizeInBytes, _forwardIndexChunkCompressionType,
+              _dictionaryUncompressedValueSizeInBytes));
+    }
+  }
+}

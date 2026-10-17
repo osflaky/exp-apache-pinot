@@ -1,0 +1,119 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pinot.query.runtime.operator;
+
+import com.google.common.base.Preconditions;
+import java.util.ArrayList;
+import java.util.List;
+import javax.annotation.Nullable;
+import org.apache.calcite.rel.RelFieldCollation;
+import org.apache.commons.collections4.CollectionUtils;
+import org.apache.pinot.common.utils.DataSchema;
+import org.apache.pinot.query.planner.plannode.MailboxReceiveNode;
+import org.apache.pinot.query.runtime.blocks.MseBlock;
+import org.apache.pinot.query.runtime.blocks.RowHeapDataBlock;
+import org.apache.pinot.query.runtime.operator.utils.SortUtils;
+import org.apache.pinot.query.runtime.plan.OpChainExecutionContext;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+
+/// This `SortedMailboxReceiveOperator` receives data from a
+/// [org.apache.pinot.query.mailbox.ReceivingMailbox] and serve it out from the [#nextBlock()] API in a
+/// sorted manner.
+///
+///  TODO: Once sorting on the `MailboxSendOperator` is available, modify this to use a k-way merge instead of
+///        resorting via the PriorityQueue.
+public class SortedMailboxReceiveOperator extends BaseMailboxReceiveOperator {
+  private static final Logger LOGGER = LoggerFactory.getLogger(SortedMailboxReceiveOperator.class);
+
+  private static final String EXPLAIN_NAME = "SORTED_MAILBOX_RECEIVE";
+
+  private final DataSchema _dataSchema;
+  private final List<RelFieldCollation> _collations;
+  /// The rows collected from the mailboxes. Sorted in place and handed downstream as-is, so [#releaseBuffers()]
+  /// drops the reference instead of clearing it: a local mailbox may still be holding the block that wraps this very
+  /// list, and emptying it would silently drop those rows.
+  @Nullable
+  private List<Object[]> _rows = new ArrayList<>();
+
+  private MseBlock _eosBlock;
+
+  // TODO: Support merge sort when sender side sort is supported.
+  public SortedMailboxReceiveOperator(OpChainExecutionContext context, MailboxReceiveNode node) {
+    super(context, node);
+    Preconditions.checkState(!CollectionUtils.isEmpty(node.getCollations()), "Field collations must be set");
+    _dataSchema = node.getDataSchema();
+    _collations = node.getCollations();
+  }
+
+  @Override
+  protected Logger logger() {
+    return LOGGER;
+  }
+
+  @Override
+  public String toExplainString() {
+    return EXPLAIN_NAME;
+  }
+
+  @Override
+  protected MseBlock getNextBlock() {
+    if (_eosBlock != null) {
+      return _eosBlock;
+    }
+    // Collect all the rows from the mailbox and sort them
+    while (true) {
+      MseBlock block = _multiConsumer.readMseBlockBlocking();
+      if (block.isData()) {
+        assert _rows != null : "Rows should not be null while collecting mailbox blocks";
+        _rows.addAll(((MseBlock.Data) block).asRowHeap().getRows());
+        continue;
+      }
+      MseBlock.Eos eosBlock = (MseBlock.Eos) block;
+      onEos();
+      _eosBlock = eosBlock;
+      List<Object[]> rows = _rows;
+      assert rows != null : "Rows should not be null when the end of stream is reached";
+      releaseBuffers();
+      if (eosBlock.isError()) {
+        return eosBlock;
+      } else {
+        if (!rows.isEmpty()) {
+          // TODO: This might not be efficient because we are sorting all the received rows. We should use a k-way merge
+          //       when sender side is sorted.
+          rows.sort(new SortUtils.SortComparator(_collations, false));
+          return new RowHeapDataBlock(rows, _dataSchema);
+        } else {
+          return block;
+        }
+      }
+    }
+  }
+
+  @Override
+  protected void releaseBuffers() {
+    _rows = null;
+  }
+
+  @Override
+  protected boolean hasBufferedState() {
+    return _rows != null;
+  }
+}

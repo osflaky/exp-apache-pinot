@@ -1,0 +1,170 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pinot.query.mailbox.channel;
+
+import io.grpc.Context;
+import io.grpc.stub.ServerCallStreamObserver;
+import io.grpc.stub.StreamObserver;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.pinot.common.proto.Mailbox.MailboxContent;
+import org.apache.pinot.common.proto.Mailbox.MailboxStatus;
+import org.apache.pinot.query.mailbox.MailboxService;
+import org.apache.pinot.query.mailbox.ReceivingMailbox;
+import org.apache.pinot.query.runtime.blocks.ErrorMseBlock;
+import org.apache.pinot.spi.exception.QueryErrorCode;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+
+/// `MailboxContentObserver` is the content streaming observer used to receive mailbox content.
+///
+/// When the observer onNext() is called (e.g. when data packet has arrived at the receiving end), it puts the
+/// mailbox content to the receiving mailbox buffer; response with the remaining buffer size of the receiving mailbox
+/// to the sender side.
+public class MailboxContentObserver implements StreamObserver<MailboxContent> {
+  private static final Logger LOGGER = LoggerFactory.getLogger(MailboxContentObserver.class);
+
+  private final MailboxService _mailboxService;
+  private final ServerCallStreamObserver<MailboxStatus> _responseObserver;
+  private final boolean _manualInboundFlowControlEnabled;
+  private final List<ByteBuffer> _mailboxBuffers = Collections.synchronizedList(new ArrayList<>());
+  private boolean _closedStream = false;
+
+  private volatile ReceivingMailbox _mailbox;
+
+  public MailboxContentObserver(MailboxService mailboxService, String mailboxId,
+      ServerCallStreamObserver<MailboxStatus> responseObserver, boolean manualInboundFlowControlEnabled) {
+    _mailboxService = mailboxService;
+    _responseObserver = responseObserver;
+    _manualInboundFlowControlEnabled = manualInboundFlowControlEnabled;
+    _mailbox = StringUtils.isNotBlank(mailboxId) ? _mailboxService.getReceivingMailbox(mailboxId) : null;
+  }
+
+  @Override
+  public void onNext(MailboxContent mailboxContent) {
+    if (_manualInboundFlowControlEnabled) {
+      // Replenish one inbound-message credit immediately, before any work that might block (e.g., the
+      // offerData lock acquisition inside _mailbox.offerRaw). This decouples the sender's HTTP/2 window
+      // replenishment from the receiver's per-message processing time — gRPC will issue the WINDOW_UPDATE
+      // for this message as soon as this request(1) call sets the credit, not waiting for onNext to return.
+      // Do not move this below the blocking _mailbox.offerRaw call — it must replenish credit
+      // BEFORE the offer so the receiver doesn't gate the sender on per-message application drain time.
+      _responseObserver.request(1);
+    }
+    // Else: gRPC's auto-inbound is in place and will automatically replenish 1 credit after onNext
+    // returns. Do not call request(1) here in that mode — it would double-count the credit and break
+    // the 1-in-flight semantics that the rollback knob restores.
+    if (_closedStream) {
+      LOGGER.debug("Received a late message once the stream was closed. Ignoring it.");
+      return;
+    }
+    String mailboxId = mailboxContent.getMailboxId();
+    if (_mailbox == null) {
+      _mailbox = _mailboxService.getReceivingMailbox(mailboxId);
+    }
+    _mailboxBuffers.add(mailboxContent.getPayload().asReadOnlyByteBuffer());
+    if (mailboxContent.getWaitForMore()) {
+      return;
+    }
+    try {
+      long timeoutMs = Context.current().getDeadline().timeRemaining(TimeUnit.MILLISECONDS);
+      ReceivingMailbox.ReceivingMailboxStatus status = _mailbox.offerRaw(_mailboxBuffers, timeoutMs);
+      switch (status) {
+        case SUCCESS:
+          _responseObserver.onNext(MailboxStatus.newBuilder().setMailboxId(mailboxId)
+              .putMetadata(ChannelUtils.MAILBOX_METADATA_BUFFER_SIZE_KEY,
+                  Integer.toString(_mailbox.getNumPendingBlocks())).build());
+          break;
+        case WAITING_EOS:
+          // The receiving mailbox is early terminated, inform the sender to stop sending more data. Only EOS block is
+          // expected to be sent afterward.
+          _responseObserver.onNext(MailboxStatus.newBuilder().setMailboxId(mailboxId)
+              .putMetadata(ChannelUtils.MAILBOX_METADATA_REQUEST_EARLY_TERMINATE, "true").build());
+          break;
+        case LAST_BLOCK:
+          LOGGER.debug("Mailbox: {} has received the last block, closing the stream", mailboxId);
+          closeStream();
+          break;
+        case ALREADY_TERMINATED:
+          // this can happen when the mailbox is cancelled by the receiver. No more messages are going to be accepted.
+          closeStream();
+          break;
+        default:
+          throw new IllegalStateException("Unsupported mailbox status: " + status);
+      }
+    } catch (Exception e) {
+      String errorMessage = "Caught exception while processing blocks for mailbox: " + mailboxId;
+      LOGGER.error(errorMessage, e);
+      closeStream();
+      _mailbox.setErrorBlock(
+          ErrorMseBlock.fromException(new RuntimeException(errorMessage, e)), List.of());
+    } finally {
+      _mailboxBuffers.clear();
+    }
+  }
+
+  private void closeStream() {
+    try {
+      // NOTE: DO NOT use onError() because it will terminate the stream, and sender might not get the callback
+      _responseObserver.onCompleted();
+      _closedStream = true;
+    } catch (Exception e) {
+      // Exception can be thrown if the stream is already closed, so we simply ignore it
+      LOGGER.debug("Caught exception cancelling mailbox: {}", _mailbox != null ? _mailbox.getId() : "unknown", e);
+    }
+  }
+
+  @Override
+  public void onError(Throwable t) {
+    LOGGER.warn("Receiving mailbox received an error from sender side", t);
+    _mailboxBuffers.clear();
+    if (_mailbox != null) {
+      String msg = t != null ? t.getMessage() : "Unknown";
+      String errorMessage = "GRPC mailbox cancelled by sender with exception: " + msg;
+      _mailbox.setErrorBlock(ErrorMseBlock.fromError(QueryErrorCode.INTERNAL, errorMessage), List.of());
+    } else {
+      LOGGER.error("Got error before mailbox is set up", t);
+    }
+    if (!_closedStream) {
+      _closedStream = true;
+      _responseObserver.onError(t);
+    }
+  }
+
+  @Override
+  public void onCompleted() {
+    _mailboxBuffers.clear();
+    if (_closedStream) {
+      return;
+    }
+    _closedStream = true;
+    try {
+      _responseObserver.onCompleted();
+    } catch (Exception e) {
+      // Exception can be thrown if the stream is already closed, so we simply ignore it
+      LOGGER.debug("Caught exception sending complete to mailbox: {}", _mailbox != null ? _mailbox.getId() : "unknown",
+          e);
+    }
+  }
+}

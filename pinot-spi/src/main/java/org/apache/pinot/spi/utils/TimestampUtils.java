@@ -1,0 +1,162 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pinot.spi.utils;
+
+import java.sql.Timestamp;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeFormatterBuilder;
+import java.time.temporal.ChronoField;
+import java.util.concurrent.TimeUnit;
+
+
+public class TimestampUtils {
+  private TimestampUtils() {
+  }
+
+  private static final long MICROS_PER_SECOND = TimeUnit.SECONDS.toMicros(1);
+  private static final long NANOS_PER_SECOND = TimeUnit.SECONDS.toNanos(1);
+  private static final int NANOS_PER_MICRO = (int) TimeUnit.MICROSECONDS.toNanos(1);
+  private static final long MILLIS_PER_SECOND = TimeUnit.SECONDS.toMillis(1);
+
+  private static final DateTimeFormatter UNIVERSAL_DATE_TIME_FORMATTER = new DateTimeFormatterBuilder()
+      // Date part
+      .appendPattern("yyyy-MM-dd")
+      // Optional time part starting with 'T'
+      .optionalStart()
+      .appendLiteral('T')
+      .appendPattern("HH:mm")
+      .optionalStart()
+      .appendLiteral(':')
+      .appendPattern("ss")
+      .optionalEnd()
+      .optionalStart()
+      .appendFraction(ChronoField.NANO_OF_SECOND, 1, 9, true)
+      .optionalEnd()
+      .optionalEnd()
+      // Optional space-separated time part
+      .optionalStart()
+      .appendLiteral(' ')
+      .appendPattern("HH:mm")
+      .optionalStart()
+      .appendLiteral(':')
+      .appendPattern("ss")
+      .optionalEnd()
+      .optionalStart()
+      .appendFraction(ChronoField.NANO_OF_SECOND, 1, 9, true)
+      .optionalEnd()
+      .optionalEnd()
+      // Time zone handling, allows parsing of 'Z', '+hh:mm', '-hh:mm'
+      .appendOptional(DateTimeFormatter.ofPattern("XXX"))
+      // Default values for missing time components
+      .parseDefaulting(ChronoField.HOUR_OF_DAY, 0)
+      .parseDefaulting(ChronoField.MINUTE_OF_HOUR, 0)
+      .parseDefaulting(ChronoField.SECOND_OF_MINUTE, 0)
+      .toFormatter();
+
+  /// Parses the given timestamp string into [Timestamp].
+  ///
+  /// Below formats of timestamp are supported:
+  ///
+  /// - 'yyyy-mm-dd hh:mm:ss\[.fffffffff\]'
+  /// - 'yyyy-MM-dd\[ HH:mm\[:ss\]\]'
+  /// - Millis since epoch
+  /// - ISO8601 format
+  public static Timestamp toTimestamp(String timestampString) {
+    try {
+      return Timestamp.valueOf(timestampString);
+    } catch (Exception e) {
+      // Try the next format
+    }
+    try {
+      return new Timestamp(Long.parseLong(timestampString));
+    } catch (Exception e) {
+      // Try the next format
+    }
+    try {
+      return Timestamp.from(ZonedDateTime.parse(timestampString, UNIVERSAL_DATE_TIME_FORMATTER).toInstant());
+    } catch (Exception e) {
+      // Try the next format
+    }
+    try {
+      LocalDateTime dateTime = LocalDateTime.parse(timestampString, UNIVERSAL_DATE_TIME_FORMATTER);
+      return Timestamp.valueOf(dateTime);
+    } catch (Exception e) {
+      throw new IllegalArgumentException("Invalid timestamp: '" + timestampString + "'");
+    }
+  }
+
+  /// Parses the given timestamp string into millis since epoch.
+  ///
+  /// Below formats of timestamp are supported:
+  ///
+  /// - 'yyyy-mm-dd hh:mm:ss\[.fffffffff\]'
+  /// - 'yyyy-MM-dd\[ HH:mm\[:ss\]\]'
+  /// - Millis since epoch
+  /// - ISO8601 format
+  public static long toMillisSinceEpoch(String timestampString) {
+    try {
+      return Timestamp.valueOf(timestampString).getTime();
+    } catch (Exception e) {
+      // Try the next format
+    }
+    try {
+      return Long.parseLong(timestampString);
+    } catch (Exception e) {
+      // Try the next format
+    }
+    try {
+      return ZonedDateTime.parse(timestampString, UNIVERSAL_DATE_TIME_FORMATTER).toInstant().toEpochMilli();
+    } catch (Exception e) {
+      // Try the next format
+    }
+    try {
+      LocalDateTime dateTime = LocalDateTime.parse(timestampString, UNIVERSAL_DATE_TIME_FORMATTER);
+      return dateTime.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli();
+    } catch (Exception e) {
+      throw new IllegalArgumentException("Invalid timestamp: '" + timestampString + "'");
+    }
+  }
+
+  /// Converts microseconds since epoch to [Timestamp], preserving sub-millisecond nanos via
+  /// [Timestamp#setNanos]. [Math#floorDiv] / [Math#floorMod] split the signed `micros` into
+  /// (epoch-seconds, sub-second nanos) so pre-epoch (negative) values round consistently.
+  public static Timestamp fromMicrosSinceEpoch(long micros) {
+    long epochSecond = Math.floorDiv(micros, MICROS_PER_SECOND);
+    int nanoOfSecond = (int) Math.floorMod(micros, MICROS_PER_SECOND) * NANOS_PER_MICRO;
+    return toTimestamp(epochSecond, nanoOfSecond);
+  }
+
+  /// Converts nanoseconds since epoch to [Timestamp], preserving full nanosecond precision via
+  /// [Timestamp#setNanos]. [Math#floorDiv] / [Math#floorMod] split the signed `nanos` into
+  /// (epoch-seconds, sub-second nanos) so pre-epoch (negative) values round consistently.
+  public static Timestamp fromNanosSinceEpoch(long nanos) {
+    long epochSecond = Math.floorDiv(nanos, NANOS_PER_SECOND);
+    int nanoOfSecond = (int) Math.floorMod(nanos, NANOS_PER_SECOND);
+    return toTimestamp(epochSecond, nanoOfSecond);
+  }
+
+  private static Timestamp toTimestamp(long epochSecond, int nanoOfSecond) {
+    Timestamp ts = new Timestamp(epochSecond * MILLIS_PER_SECOND);
+    ts.setNanos(nanoOfSecond);
+    return ts;
+  }
+}

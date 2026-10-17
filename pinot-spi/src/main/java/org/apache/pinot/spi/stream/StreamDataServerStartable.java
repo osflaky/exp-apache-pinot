@@ -1,0 +1,81 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pinot.spi.stream;
+
+import java.util.Properties;
+import org.apache.commons.lang3.NotImplementedException;
+
+
+/// StreamDataServerStartable is the interface for stream data sources.
+/// Each stream data connector should implement a mock/wrapper of the data server.
+///
+/// E.g. KafkaDataServerStartable is a wrapper class of Kafka 2.x broker.
+public interface StreamDataServerStartable {
+  /// Init the server.
+  ///
+  /// @param props
+  void init(Properties props);
+
+  /// Start the server
+  void start();
+
+  /// Stop the server
+  void stop();
+
+  /// Create a data stream (e.g Kafka topic) in the server.
+  ///
+  /// @param topic
+  /// @param topicProps
+  void createTopic(String topic, Properties topicProps);
+
+  /// Create a data stream with the given partition count.
+  ///
+  /// @param topic topic name
+  /// @param numPartitions number of partitions
+  default void createTopic(String topic, int numPartitions) {
+    Properties topicProps = new Properties();
+    topicProps.setProperty("partition", Integer.toString(numPartitions));
+    createTopic(topic, topicProps);
+  }
+
+  /// Delete a data stream (e.g Kafka topic) in the server.
+  ///
+  /// @param topic
+  default void deleteTopic(String topic) {
+    throw new NotImplementedException("deleteTopic is not implemented!");
+  }
+
+  /// @param topic
+  /// @param numPartitions
+  default void createPartitions(String topic, int numPartitions) {
+    throw new NotImplementedException("createPartitions is not implemented!");
+  }
+
+  /// Delete records before a given offset for a topic partition.
+  ///
+  /// @param topic topic name
+  /// @param partition partition id
+  /// @param offset offset boundary (exclusive)
+  default void deleteRecordsBeforeOffset(String topic, int partition, long offset) {
+    throw new NotImplementedException("deleteRecordsBeforeOffset is not implemented!");
+  }
+
+  /// Get the port of the server.
+  int getPort();
+}

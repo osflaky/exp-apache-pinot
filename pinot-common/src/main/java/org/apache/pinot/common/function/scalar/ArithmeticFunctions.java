@@ -1,0 +1,318 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pinot.common.function.scalar;
+
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.util.concurrent.ThreadLocalRandom;
+import org.apache.pinot.spi.annotations.FunctionVolatility;
+import org.apache.pinot.spi.annotations.ScalarFunction;
+
+
+/// Arithmetic scalar functions.
+public class ArithmeticFunctions {
+  private static final double DOUBLE_UNIT = 0x1.0p-53;
+
+  private ArithmeticFunctions() {
+  }
+
+  @ScalarFunction(names = {"div", "divide"})
+  public static double divide(double a, double b) {
+    return a / b;
+  }
+
+  @ScalarFunction(names = {"div", "divide"})
+  public static double divide(double a, double b, double defaultValue) {
+    return (b == 0) ? defaultValue : a / b;
+  }
+
+  @ScalarFunction
+  public static long intDiv(double a, double b) {
+    return (long) Math.floor(a / b);
+  }
+
+  @ScalarFunction
+  public static long intDivOrZero(double a, double b) {
+    //Same as intDiv but returns zero when dividing by zero or when dividing a minimal negative number by minus one.
+    return (b == 0 || (a == Long.MIN_VALUE && b == -1)) ? 0 : intDiv(a, b);
+  }
+
+  @ScalarFunction
+  public static int isFinite(double value) {
+    return Double.isFinite(value) ? 1 : 0;
+  }
+
+  @ScalarFunction
+  public static int isInfinite(double value) {
+    return Double.isInfinite(value) ? 1 : 0;
+  }
+
+  @ScalarFunction
+  public static double ifNotFinite(double valueToCheck, double defaultValue) {
+    return Double.isFinite(valueToCheck) ? valueToCheck : defaultValue;
+  }
+
+  @ScalarFunction
+  public static int isNaN(double value) {
+    return Double.isNaN(value) ? 1 : 0;
+  }
+
+  @ScalarFunction(names = {"ceil", "ceiling"})
+  public static double ceil(double a) {
+    return Math.ceil(a);
+  }
+
+  @ScalarFunction
+  public static double floor(double a) {
+    return Math.floor(a);
+  }
+
+  @ScalarFunction
+  public static double exp(double a) {
+    return Math.exp(a);
+  }
+
+  @ScalarFunction(names = {"ln", "log"})
+  public static double ln(double a) {
+    return Math.log(a);
+  }
+
+  @ScalarFunction
+  public static double log2(double a) {
+    return Math.log(a) / Math.log(2);
+  }
+
+  @ScalarFunction
+  public static double log10(double a) {
+    return Math.log10(a);
+  }
+
+  @ScalarFunction
+  public static double sqrt(double a) {
+    return Math.sqrt(a);
+  }
+
+  @ScalarFunction
+  public static double sign(double a) {
+    return Math.signum(a);
+  }
+
+  @ScalarFunction(names = {"pow", "power"})
+  public static double power(double a, double exponent) {
+    return Math.pow(a, exponent);
+  }
+
+  // Big Decimal Implementation has been used here to avoid overflows
+  // when multiplying by Math.pow(10, scale) for rounding
+  @ScalarFunction
+  public static double roundDecimal(double a, int scale) {
+    if (Double.isNaN(a) || Double.isInfinite(a)) {
+      // Follow standard PostgreSQL behavior where NaN and +/- Inf are returned as is
+      return a;
+    }
+    return BigDecimal.valueOf(a).setScale(scale, RoundingMode.HALF_UP).doubleValue();
+  }
+
+  // TODO: The function should ideally be named 'round'
+  // but it is not possible because of existing DateTimeFunction with same name.
+  @ScalarFunction
+  public static double roundDecimal(double a) {
+    if (Double.isNaN(a) || Double.isInfinite(a)) {
+      // Math.round has special handling for NaN and +/- Inf:
+      // NaN -> 0, -Inf -> Long.MIN_VALUE, +Inf -> Long.MAX_VALUE
+      // Follow standard PostgreSQL behavior where NaN and +/- Inf are returned as is
+      return a;
+    }
+    return Math.round(a);
+  }
+
+  // Big Decimal Implementation has been used here to avoid overflows
+  // when multiplying by Math.pow(10, scale) for rounding
+  @ScalarFunction
+  public static double truncate(double a, int scale) {
+    return BigDecimal.valueOf(a).setScale(scale, RoundingMode.DOWN).doubleValue();
+  }
+
+  @ScalarFunction
+  public static double truncate(double a) {
+    return Math.signum(a) * Math.floor(Math.abs(a));
+  }
+
+  @ScalarFunction(isDeterministic = false, volatility = FunctionVolatility.VOLATILE)
+  public static double rand() {
+    return ThreadLocalRandom.current().nextDouble();
+  }
+
+  @ScalarFunction
+  public static double rand(long seed) {
+    return deterministicRand(seed);
+  }
+
+  private static double deterministicRand(long seed) {
+    // The XOR with 0x5DEECE66DL is inspired by java.util.Random's initial LCG multiplier scramble,
+    // but unlike Random, we use a custom non-linear mix64 routine for diffusion and reproducible output.
+    // This approach is chosen to provide deterministic, well-diffused pseudo-random values, not to match Random's
+    // output.
+    // Reference for multiplier: https://docs.oracle.com/javase/8/docs/api/java/util/Random.html
+    long mixed = mix64(seed ^ 0x5DEECE66DL);
+    // Right-shift by 11 bits to extract the top 53 bits for use as the mantissa of an IEEE 754 double-precision value.
+    // This produces a double in [0,1) with full precision.
+    return (mixed >>> 11) * DOUBLE_UNIT;
+  }
+
+  private static long mix64(long z) {
+    z = (z ^ (z >>> 33)) * 0xff51afd7ed558ccdL;
+    z = (z ^ (z >>> 33)) * 0xc4ceb9fe1a85ec53L;
+    return z ^ (z >>> 33);
+  }
+
+  @ScalarFunction
+  public static long gcd(long a, long b) {
+    return a == 0 ? Math.abs(b) : gcd(b % a, a);
+  }
+
+  @ScalarFunction
+  public static long lcm(long a, long b) {
+    if (a == 0 || b == 0) {
+      return 0;
+    }
+    return Math.abs(a) / gcd(a, b) * Math.abs(b);
+  }
+
+  @ScalarFunction
+  public static double hypot(double a, double b) {
+    return Math.hypot(a, b);
+  }
+
+  @ScalarFunction
+  public static int byteswapInt(int a) {
+    return Integer.reverseBytes(a);
+  }
+
+  @ScalarFunction
+  public static long byteswapLong(long a) {
+    // Skip the heading 0s in the long value
+    return Long.reverseBytes(a);
+  }
+
+  /// Returns the cube root of the given value.
+  @ScalarFunction
+  public static double cbrt(double a) {
+    return Math.cbrt(a);
+  }
+
+  /// Returns 2 raised to the power of the given value.
+  @ScalarFunction
+  public static double exp2(double a) {
+    return Math.pow(2, a);
+  }
+
+  /// Returns 10 raised to the power of the given value.
+  @ScalarFunction
+  public static double exp10(double a) {
+    return Math.pow(10, a);
+  }
+
+  /// Returns log(1 + x), computed in a way that is accurate even when x is close to zero.
+  @ScalarFunction
+  public static double log1p(double a) {
+    return Math.log1p(a);
+  }
+
+  /// Returns the sigmoid (logistic) function: 1 / (1 + e^(-x)).
+  @ScalarFunction
+  public static double sigmoid(double a) {
+    return 1.0 / (1.0 + Math.exp(-a));
+  }
+
+  /// Returns the mathematical constant pi (π).
+  @ScalarFunction
+  public static double pi() {
+    return Math.PI;
+  }
+
+  /// Returns Euler's number (e), the base of the natural logarithm.
+  @ScalarFunction(names = {"e", "euler"})
+  public static double e() {
+    return Math.E;
+  }
+
+  /// Returns the number of set bits (popcount) in the binary representation of the given long value.
+  @ScalarFunction
+  public static int bitCount(long a) {
+    return Long.bitCount(a);
+  }
+
+  // Precomputed factorials for 0! through 20! (21! overflows long).
+  private static final long[] FACTORIALS = new long[21];
+
+  static {
+    FACTORIALS[0] = 1;
+    for (int i = 1; i < FACTORIALS.length; i++) {
+      FACTORIALS[i] = FACTORIALS[i - 1] * i;
+    }
+  }
+
+  /// Returns the factorial of the given non-negative integer.
+  ///
+  /// @param n non-negative integer (0 to 20)
+  /// @return n! as a long
+  /// @throws IllegalArgumentException if n is negative or greater than 20
+  @ScalarFunction
+  public static long factorial(long n) {
+    if (n < 0 || n > 20) {
+      throw new IllegalArgumentException("factorial argument must be between 0 and 20, got " + n);
+    }
+    return FACTORIALS[(int) n];
+  }
+
+  /// Returns the bucket number for a value in a histogram with the given bounds and number of buckets.
+  ///
+  /// SQL standard semantics: returns 0 if value < lo, numBuckets + 1 if value >= hi,
+  /// otherwise a bucket in the range \[1, numBuckets\].
+  ///
+  /// @param value the value to bucket
+  /// @param lo lower bound of the histogram (inclusive)
+  /// @param hi upper bound of the histogram (exclusive)
+  /// @param numBuckets number of equal-width buckets
+  /// @return bucket number (0 to numBuckets + 1)
+  /// @throws IllegalArgumentException if lo >= hi or numBuckets <= 0
+  @ScalarFunction(names = {"widthBucket", "width_bucket"})
+  public static int widthBucket(double value, double lo, double hi, int numBuckets) {
+    if (Double.isNaN(value) || Double.isNaN(lo) || Double.isNaN(hi)) {
+      throw new IllegalArgumentException("widthBucket does not accept NaN values");
+    }
+    if (Double.isInfinite(lo) || Double.isInfinite(hi)) {
+      throw new IllegalArgumentException("widthBucket bounds must be finite");
+    }
+    if (lo >= hi) {
+      throw new IllegalArgumentException("lo must be less than hi: lo=" + lo + ", hi=" + hi);
+    }
+    if (numBuckets <= 0) {
+      throw new IllegalArgumentException("numBuckets must be positive, got " + numBuckets);
+    }
+    if (value < lo) {
+      return 0;
+    }
+    if (value >= hi) {
+      return numBuckets + 1;
+    }
+    return (int) ((value - lo) / (hi - lo) * numBuckets) + 1;
+  }
+}

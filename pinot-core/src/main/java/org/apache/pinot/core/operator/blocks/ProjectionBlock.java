@@ -1,0 +1,98 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pinot.core.operator.blocks;
+
+import java.util.Map;
+import org.apache.pinot.common.request.context.ExpressionContext;
+import org.apache.pinot.core.common.BlockValSet;
+import org.apache.pinot.core.common.DataBlockCache;
+import org.apache.pinot.core.operator.docvalsets.ProjectionBlockValSet;
+import org.apache.pinot.segment.spi.datasource.DataSource;
+import org.apache.pinot.segment.spi.datasource.MapDataSource;
+import org.apache.pinot.segment.spi.datasource.OpenStructDataSource;
+import org.apache.pinot.spi.data.ComplexFieldSpec;
+import org.apache.pinot.spi.exception.BadQueryRequestException;
+
+
+/// ProjectionBlock holds a column name to Block Map.
+/// It provides DocIdSetBlock for a given column.
+public class ProjectionBlock implements ValueBlock {
+  private final Map<String, DataSource> _dataSourceMap;
+  private final DataBlockCache _dataBlockCache;
+
+  public ProjectionBlock(Map<String, DataSource> dataSourceMap, DataBlockCache dataBlockCache) {
+    _dataSourceMap = dataSourceMap;
+    _dataBlockCache = dataBlockCache;
+  }
+
+  @Override
+  public int getNumDocs() {
+    return _dataBlockCache.getNumDocs();
+  }
+
+  @Override
+  public int[] getDocIds() {
+    return _dataBlockCache.getDocIds();
+  }
+
+  @Override
+  public BlockValSet getBlockValueSet(ExpressionContext expression) {
+    assert expression.getType() == ExpressionContext.Type.IDENTIFIER;
+    return getBlockValueSet(expression.getIdentifier());
+  }
+
+  @Override
+  public BlockValSet getBlockValueSet(String column) {
+    DataSource dataSource = _dataSourceMap.get(column);
+    // An OPEN_STRUCT parent is only a handle for per-key resolution — it has no forward index, so DataFetcher does
+    // not register it and it cannot be read as a column. Reject it here rather than letting the missing
+    // ColumnValueReader surface as an NPE.
+    if (dataSource instanceof OpenStructDataSource) {
+      throw new BadQueryRequestException(
+          "OPEN_STRUCT column: " + column + " cannot be selected directly; use " + column + "['key']");
+    }
+    return new ProjectionBlockValSet(_dataBlockCache, column, dataSource);
+  }
+
+  @Override
+  public BlockValSet getBlockValueSet(String[] paths) {
+    // TODO: only support one level of path for now, e.g. `map.key`
+    assert paths.length == 2;
+    String fullColumnKeyName = ComplexFieldSpec.getFullChildName(paths);
+    // Resolve once per ProjectionOperator, not once per block: _dataSourceMap is owned by the operator and
+    // shared across every block of the segment. Re-resolving an absent OPEN_STRUCT key rebuilds a null bitmap
+    // spanning the whole segment on each block, and DataFetcher keeps the first reader registered under the
+    // name anyway, so every later resolution is garbage that also leaves this map disagreeing with the fetcher.
+    if (_dataSourceMap.containsKey(fullColumnKeyName)) {
+      return getBlockValueSet(fullColumnKeyName);
+    }
+    DataSource columnDataSource = _dataSourceMap.get(paths[0]);
+    DataSource keyDataSource;
+    if (columnDataSource instanceof MapDataSource) {
+      keyDataSource = ((MapDataSource) columnDataSource).getDataSource(paths[1]);
+    } else if (columnDataSource instanceof OpenStructDataSource) {
+      keyDataSource = ((OpenStructDataSource) columnDataSource).getDataSource(paths[1]);
+    } else {
+      throw new IllegalStateException("Path-based access requires MAP or OPEN_STRUCT column: " + paths[0]);
+    }
+    _dataSourceMap.put(fullColumnKeyName, keyDataSource);
+    _dataBlockCache.addDataSource(fullColumnKeyName, keyDataSource);
+    return getBlockValueSet(fullColumnKeyName);
+  }
+}

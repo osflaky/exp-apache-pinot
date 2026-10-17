@@ -1,0 +1,285 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pinot.query.runtime.timeseries;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.TimeUnit;
+import javax.annotation.Nullable;
+import org.apache.pinot.common.datatable.DataTable;
+import org.apache.pinot.spi.exception.QueryErrorCode;
+import org.apache.pinot.spi.exception.QueryException;
+import org.apache.pinot.tsdb.spi.AggInfo;
+import org.apache.pinot.tsdb.spi.TimeBuckets;
+import org.apache.pinot.tsdb.spi.operator.BaseTimeSeriesOperator;
+import org.apache.pinot.tsdb.spi.series.BaseTimeSeriesBuilder;
+import org.apache.pinot.tsdb.spi.series.TimeSeries;
+import org.apache.pinot.tsdb.spi.series.TimeSeriesBlock;
+import org.apache.pinot.tsdb.spi.series.TimeSeriesBuilderFactory;
+
+
+/// # Overview
+///
+/// Receives and optionally aggregates the response from all servers for the corresponding plan node.
+///
+/// ## Aggregate Receive
+///
+/// When a non-null [AggInfo] is passed, this operator will aggregate the received data using the corresponding
+/// series builder created via [TimeSeriesBuilderFactory].
+///
+/// ## Non-Aggregate Receive
+///
+/// When a null AggInfo is passed, then we don't perform any aggregation. If we receive series with the same ID from
+/// different servers, we will simply append them to the list, creating a union.
+public class TimeSeriesExchangeReceiveOperator extends BaseTimeSeriesOperator {
+
+  private static final List<DataTable.MetadataKey> ADDITIVE_STATS_KEYS = List.of(
+      DataTable.MetadataKey.NUM_DOCS_SCANNED,
+      DataTable.MetadataKey.NUM_ENTRIES_SCANNED_IN_FILTER,
+      DataTable.MetadataKey.NUM_ENTRIES_SCANNED_POST_FILTER,
+      DataTable.MetadataKey.NUM_SEGMENTS_QUERIED,
+      DataTable.MetadataKey.NUM_SEGMENTS_PROCESSED,
+      DataTable.MetadataKey.NUM_SEGMENTS_MATCHED,
+      DataTable.MetadataKey.NUM_CONSUMING_SEGMENTS_QUERIED,
+      DataTable.MetadataKey.NUM_CONSUMING_SEGMENTS_PROCESSED,
+      DataTable.MetadataKey.NUM_CONSUMING_SEGMENTS_MATCHED,
+      DataTable.MetadataKey.TOTAL_DOCS,
+      DataTable.MetadataKey.NUM_SEGMENTS_PRUNED_BY_SERVER,
+      DataTable.MetadataKey.NUM_SEGMENTS_PRUNED_INVALID,
+      DataTable.MetadataKey.NUM_SEGMENTS_PRUNED_BY_LIMIT,
+      DataTable.MetadataKey.NUM_SEGMENTS_PRUNED_BY_VALUE
+  );
+
+  private static final List<DataTable.MetadataKey> MIN_STATS_KEYS = List.of(
+      DataTable.MetadataKey.MIN_CONSUMING_FRESHNESS_TIME_MS
+  );
+
+  /// Receiver will receive either TimeSeriesBlock or Throwable. And will have at most \_numServersQueried objects that
+  /// can be polled.
+  private final BlockingQueue<Object> _receiver;
+  private final long _deadlineMs;
+  private final int _numServersQueried;
+  @Nullable
+  private final AggInfo _aggInfo;
+  private final TimeSeriesBuilderFactory _factory;
+
+  public TimeSeriesExchangeReceiveOperator(BlockingQueue<Object> receiver, long deadlineMs, int numServersQueried,
+      @Nullable AggInfo aggInfo, TimeSeriesBuilderFactory seriesBuilderFactory) {
+    super(List.of());
+    Preconditions.checkArgument(numServersQueried > 0, "No servers to query in receive operator");
+    _receiver = receiver;
+    _deadlineMs = deadlineMs;
+    _numServersQueried = numServersQueried;
+    _aggInfo = aggInfo;
+    _factory = seriesBuilderFactory;
+  }
+
+  @Override
+  public TimeSeriesBlock getNextBlock() {
+    try {
+      if (_aggInfo == null) {
+        return getNextBlockNoAggregation();
+      } else {
+        return getNextBlockWithAggregation();
+      }
+    } catch (Throwable t) {
+      throw new RuntimeException(t.getMessage(), t);
+    }
+  }
+
+  @Override
+  public String getExplainName() {
+    return "TIME_SERIES_EXCHANGE_RECEIVE";
+  }
+
+  @VisibleForTesting
+  protected Object poll(long remainingTimeMs)
+      throws InterruptedException {
+    if (remainingTimeMs <= 0) {
+      return null;
+    }
+    return _receiver.poll(remainingTimeMs, TimeUnit.MILLISECONDS);
+  }
+
+  private TimeSeriesBlock getNextBlockWithAggregation()
+      throws Throwable {
+    TimeBuckets timeBuckets = null;
+    Map<Long, BaseTimeSeriesBuilder> seriesBuilderMap = new HashMap<>();
+    Map<String, String> aggregatedStats = new HashMap<>();
+    List<QueryException> allExceptions = new ArrayList<>();
+    QueryException timeoutException = null;
+
+    for (int index = 0; index < _numServersQueried; index++) {
+      // Step-1: Poll, and ensure we received a TimeSeriesBlock.
+      long remainingTimeMs = _deadlineMs - System.currentTimeMillis();
+      Object result = poll(remainingTimeMs);
+      if (result == null) {
+        // TODO: List host:port of unresponsive servers in the exception message.
+        timeoutException = new QueryException(QueryErrorCode.SERVER_NOT_RESPONDING,
+          "Timed out waiting for response. Waited: "
+            + remainingTimeMs
+            + " ms and successfully polled: "
+            + index
+            + " of "
+            + _numServersQueried);
+        break;
+      }
+      if (result instanceof Throwable) {
+        throw (Throwable) result;
+      }
+      Preconditions.checkState(result instanceof TimeSeriesBlock,
+          "Found unexpected object. This is a bug: %s", result.getClass());
+      // Step-2: Init timeBuckets and ensure they are the same across all servers.
+      TimeSeriesBlock blockToMerge = (TimeSeriesBlock) result;
+      // Merge exceptions from the received block
+      allExceptions.addAll(blockToMerge.getExceptions());
+      if (timeBuckets == null) {
+        timeBuckets = blockToMerge.getTimeBuckets();
+      } else {
+        Preconditions.checkState(timeBuckets.equals(blockToMerge.getTimeBuckets()),
+            "Found unequal time buckets from server response");
+      }
+      // Step-3: Merge new block with existing block.
+      for (var entry : blockToMerge.getSeriesMap().entrySet()) {
+        long seriesHash = entry.getKey();
+        List<TimeSeries> currentSeriesList = entry.getValue();
+        TimeSeries sampledTimeSeries = currentSeriesList.get(0);
+        // Init seriesBuilder if required
+        BaseTimeSeriesBuilder seriesBuilder = seriesBuilderMap.get(seriesHash);
+        if (seriesBuilder == null) {
+          seriesBuilder = _factory.newTimeSeriesBuilder(
+              _aggInfo, Long.toString(seriesHash), timeBuckets, sampledTimeSeries.getTagNames(),
+              sampledTimeSeries.getTagValues());
+          seriesBuilderMap.put(seriesHash, seriesBuilder);
+        }
+        for (TimeSeries timeSeries : currentSeriesList) {
+          seriesBuilder.mergeAlignedSeries(timeSeries);
+        }
+      }
+      // Step-4: Merge stats
+      mergeStats(aggregatedStats, blockToMerge.getMetadata());
+    }
+    // Convert series builders to series and return.
+    Map<Long, List<TimeSeries>> seriesMap = new HashMap<>(seriesBuilderMap.size());
+    for (var entry : seriesBuilderMap.entrySet()) {
+      long seriesHash = entry.getKey();
+      List<TimeSeries> timeSeriesList = new ArrayList<>();
+      timeSeriesList.add(entry.getValue().build());
+      seriesMap.put(seriesHash, timeSeriesList);
+    }
+    TimeSeriesBlock resultBlock = new TimeSeriesBlock(timeBuckets, seriesMap, aggregatedStats);
+    // Add all collected exceptions to the result block
+    allExceptions.forEach(resultBlock::addToExceptions);
+    if (timeoutException != null) {
+      resultBlock.addToExceptions(timeoutException);
+    }
+    return resultBlock;
+  }
+
+  /// TODO: Consider consolidating stats merging logic with
+  /// [org.apache.pinot.core.query.reduce.ExecutionStatsAggregator]
+  private void mergeStats(Map<String, String> aggregatedStats, Map<String, String> metadata) {
+    for (DataTable.MetadataKey statKey : ADDITIVE_STATS_KEYS) {
+      String key = statKey.getName();
+      String existingValue = aggregatedStats.getOrDefault(key, "0");
+      String newValue = metadata.get(key);
+      if (newValue != null) {
+        try {
+          long newLong = Long.parseLong(newValue);
+          long existingLong = Long.parseLong(existingValue);
+          aggregatedStats.put(key, Long.toString(existingLong + newLong));
+        } catch (NumberFormatException e) {
+          // Ignore malformed stats
+        }
+      }
+    }
+
+    for (DataTable.MetadataKey statKey : MIN_STATS_KEYS) {
+      String key = statKey.getName();
+      String existingValue = aggregatedStats.getOrDefault(key, Long.toString(Long.MAX_VALUE));
+      String newValue = metadata.get(key);
+      if (newValue != null) {
+        try {
+          long newLong = Long.parseLong(newValue);
+          long existingLong = Long.parseLong(existingValue);
+          aggregatedStats.put(key, Long.toString(Math.min(existingLong, newLong)));
+        } catch (NumberFormatException e) {
+          // Ignore malformed stats
+        }
+      }
+    }
+  }
+
+  private TimeSeriesBlock getNextBlockNoAggregation()
+      throws Throwable {
+    Map<Long, List<TimeSeries>> timeSeriesMap = new HashMap<>();
+    TimeBuckets timeBuckets = null;
+    Map<String, String> aggregatedStats = new HashMap<>();
+    List<QueryException> allExceptions = new ArrayList<>();
+    QueryException timeoutException = null;
+    for (int index = 0; index < _numServersQueried; index++) {
+      long remainingTimeMs = _deadlineMs - System.currentTimeMillis();
+      Object result = poll(remainingTimeMs);
+      // TODO: List host:port of unresponsive servers in the exception message.
+      if (result == null) {
+        timeoutException = new QueryException(QueryErrorCode.SERVER_NOT_RESPONDING,
+            "Timed out waiting for response. Waited: "
+                + remainingTimeMs
+                + " ms and successfully polled: "
+                + index
+                + " of "
+                + _numServersQueried);
+        break;
+      }
+      if (result instanceof Throwable) {
+        throw ((Throwable) result);
+      }
+      Preconditions.checkState(result instanceof TimeSeriesBlock,
+          "Found unexpected object. This is a bug: %s", result.getClass());
+      TimeSeriesBlock blockToMerge = (TimeSeriesBlock) result;
+      // Merge exceptions from the received block
+      allExceptions.addAll(blockToMerge.getExceptions());
+      if (timeBuckets == null) {
+        timeBuckets = blockToMerge.getTimeBuckets();
+      } else {
+        Preconditions.checkState(timeBuckets.equals(blockToMerge.getTimeBuckets()),
+            "Found unequal time buckets from server response");
+      }
+      for (var entry : blockToMerge.getSeriesMap().entrySet()) {
+        long seriesHash = entry.getKey();
+        List<TimeSeries> timeSeriesList = entry.getValue();
+        timeSeriesMap.computeIfAbsent(seriesHash, x -> new ArrayList<>()).addAll(timeSeriesList);
+      }
+      mergeStats(aggregatedStats, blockToMerge.getMetadata());
+    }
+    Preconditions.checkNotNull(timeBuckets, "Time buckets is null in exchange receive operator");
+    TimeSeriesBlock resultBlock = new TimeSeriesBlock(timeBuckets, timeSeriesMap, aggregatedStats);
+    // Add all collected exceptions to the result block
+    allExceptions.forEach(resultBlock::addToExceptions);
+    if (timeoutException != null) {
+      resultBlock.addToExceptions(timeoutException);
+    }
+    return resultBlock;
+  }
+}

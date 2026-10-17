@@ -1,0 +1,290 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pinot.server.starter.helix;
+
+import java.util.concurrent.ExecutorService;
+import javax.annotation.Nullable;
+import org.apache.helix.NotificationContext;
+import org.apache.helix.model.Message;
+import org.apache.helix.participant.statemachine.StateModel;
+import org.apache.helix.participant.statemachine.StateModelFactory;
+import org.apache.helix.participant.statemachine.StateModelInfo;
+import org.apache.helix.participant.statemachine.Transition;
+import org.apache.pinot.core.data.manager.InstanceDataManager;
+import org.apache.pinot.segment.local.data.manager.TableDataManager;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+
+/// Data Server layer state model to take over how to operate on:
+/// 1. Add a new segment
+/// 2. Refresh an existed now serving segment.
+/// 3. Delete an existed segment.
+public class SegmentOnlineOfflineStateModelFactory extends StateModelFactory<StateModel> {
+
+  protected final String _instanceId;
+  protected final InstanceDataManager _instanceDataManager;
+  /// Provides custom thread pools for executing Helix state transition messages. If this is null, all state
+  /// transition message will be executed using the default shared thread pool by Helix
+  @Nullable
+  protected final StateTransitionThreadPoolManager _stateTransitionThreadPoolManager;
+
+  public SegmentOnlineOfflineStateModelFactory(InstanceDataManager instanceDataManager,
+      @Nullable StateTransitionThreadPoolManager stateTransitionThreadPoolManager) {
+    _instanceId = instanceDataManager.getInstanceId();
+    _instanceDataManager = instanceDataManager;
+    _stateTransitionThreadPoolManager = stateTransitionThreadPoolManager;
+  }
+
+  public static String getStateModelName() {
+    return "SegmentOnlineOfflineStateModel";
+  }
+
+  @Override
+  public StateModel createNewStateModel(String resourceName, String partitionName) {
+    return new SegmentOnlineOfflineStateModel();
+  }
+
+  // Helix seems to need StateModelInfo annotation for 'initialState'. It does not use the 'states' field.
+  // The transitions in the helix messages indicate the from/to states, and helix uses the
+  // Transition annotations (but only if StateModelInfo is defined).
+  @SuppressWarnings("unused")
+  @StateModelInfo(states = "{'OFFLINE','ONLINE', 'CONSUMING', 'DROPPED'}", initialState = "OFFLINE")
+  public class SegmentOnlineOfflineStateModel extends StateModel {
+    private final Logger _logger = LoggerFactory.getLogger(_instanceId + " - SegmentOnlineOfflineStateModel");
+
+    @Transition(from = "OFFLINE", to = "CONSUMING")
+    public void onBecomeConsumingFromOffline(Message message, NotificationContext context)
+        throws Exception {
+      _logger.info("SegmentOnlineOfflineStateModel.onBecomeConsumingFromOffline() : {}", message);
+
+      try {
+        _instanceDataManager.addConsumingSegment(message.getResourceName(), message.getPartitionName());
+      } catch (Exception e) {
+        _logger.error(
+            "Caught exception while processing SegmentOnlineOfflineStateModel.onBecomeConsumingFromOffline() for "
+                + "table: {}, segment: {}",
+            message.getResourceName(), message.getPartitionName(), e);
+        throw e;
+      }
+    }
+
+    @Transition(from = "CONSUMING", to = "ONLINE")
+    public void onBecomeOnlineFromConsuming(Message message, NotificationContext context)
+        throws Exception {
+      _logger.info("SegmentOnlineOfflineStateModel.onBecomeOnlineFromConsuming() : {}", message);
+
+      try {
+        _instanceDataManager.addOnlineSegment(message.getResourceName(), message.getPartitionName());
+      } catch (Exception e) {
+        _logger.error(
+            "Caught exception while processing SegmentOnlineOfflineStateModel.onBecomeOnlineFromConsuming() for "
+                + "table: {}, segment: {}",
+            message.getResourceName(), message.getPartitionName(), e);
+        throw e;
+      }
+    }
+
+    @Transition(from = "CONSUMING", to = "OFFLINE")
+    public void onBecomeOfflineFromConsuming(Message message, NotificationContext context)
+        throws Exception {
+      _logger.info("SegmentOnlineOfflineStateModel.onBecomeOfflineFromConsuming() : {}", message);
+      try {
+        String realtimeTableName = message.getResourceName();
+        String segmentName = message.getPartitionName();
+        _instanceDataManager.offloadSegment(realtimeTableName, segmentName);
+        onConsumingToOffline(realtimeTableName, segmentName);
+      } catch (Exception e) {
+        _logger.error(
+            "Caught exception while processing SegmentOnlineOfflineStateModel.onBecomeOfflineFromConsuming() for "
+                + "table: {}, segment: {}",
+            message.getResourceName(), message.getPartitionName(), e);
+        throw e;
+      }
+    }
+
+    private void onConsumingToOffline(String realtimeTableName, String segmentName) {
+      TableDataManager tableDataManager = _instanceDataManager.getTableDataManager(realtimeTableName);
+      if (tableDataManager == null) {
+        _logger.warn(
+            "Failed to find data manager for table: {}, skip invoking consuming to offline callback for segment: {}",
+            realtimeTableName, segmentName);
+        return;
+      }
+      tableDataManager.onConsumingToOffline(segmentName);
+    }
+
+    @Transition(from = "CONSUMING", to = "DROPPED")
+    public void onBecomeDroppedFromConsuming(Message message, NotificationContext context)
+        throws Exception {
+      _logger.info("SegmentOnlineOfflineStateModel.onBecomeDroppedFromConsuming() : {}", message);
+      try {
+        String realtimeTableName = message.getResourceName();
+        String segmentName = message.getPartitionName();
+        _instanceDataManager.offloadSegment(realtimeTableName, segmentName);
+        _instanceDataManager.deleteSegment(realtimeTableName, segmentName);
+        onConsumingToDropped(realtimeTableName, segmentName);
+      } catch (Exception e) {
+        _logger.error(
+            "Caught exception while processing SegmentOnlineOfflineStateModel.onBecomeDroppedFromConsuming() for "
+                + "table: {}, segment: {}",
+            message.getResourceName(), message.getPartitionName(), e);
+        throw e;
+      }
+    }
+
+    /// Should be invoked after segment is offloaded and deleted so that it can safely release the resources from table
+    /// data manager.
+    private void onConsumingToDropped(String realtimeTableName, String segmentName) {
+      TableDataManager tableDataManager = _instanceDataManager.getTableDataManager(realtimeTableName);
+      if (tableDataManager == null) {
+        _logger.warn(
+            "Failed to find data manager for table: {}, skip invoking consuming to dropped callback for segment: {}",
+            realtimeTableName, segmentName);
+        return;
+      }
+      tableDataManager.onConsumingToDropped(segmentName);
+    }
+
+    @Transition(from = "OFFLINE", to = "ONLINE")
+    public void onBecomeOnlineFromOffline(Message message, NotificationContext context)
+        throws Exception {
+      _logger.info("SegmentOnlineOfflineStateModel.onBecomeOnlineFromOffline() : {}", message);
+      try {
+        _instanceDataManager.addOnlineSegment(message.getResourceName(), message.getPartitionName());
+      } catch (Exception e) {
+        _logger.error(
+            "Caught exception while processing SegmentOnlineOfflineStateModel.onBecomeOnlineFromOffline() for table: "
+                + "{}, segment: {}",
+            message.getResourceName(), message.getPartitionName(), e);
+        throw e;
+      }
+    }
+
+    @Transition(from = "ONLINE", to = "OFFLINE")
+    public void onBecomeOfflineFromOnline(Message message, NotificationContext context)
+        throws Exception {
+      _logger.info("SegmentOnlineOfflineStateModel.onBecomeOfflineFromOnline() : {}", message);
+      try {
+        _instanceDataManager.offloadSegment(message.getResourceName(), message.getPartitionName());
+      } catch (Exception e) {
+        _logger.error(
+            "Caught exception while processing SegmentOnlineOfflineStateModel.onBecomeOfflineFromOnline() for table: "
+                + "{}, segment: {}",
+            message.getResourceName(), message.getPartitionName(), e);
+        throw e;
+      }
+    }
+
+    @Transition(from = "OFFLINE", to = "DROPPED")
+    public void onBecomeDroppedFromOffline(Message message, NotificationContext context)
+        throws Exception {
+      _logger.info("SegmentOnlineOfflineStateModel.onBecomeDroppedFromOffline() : {}", message);
+
+      try {
+        String tableNameWithType = message.getResourceName();
+        String segmentName = message.getPartitionName();
+        _instanceDataManager.deleteSegment(tableNameWithType, segmentName);
+      } catch (Exception e) {
+        _logger.error(
+            "Caught exception while processing SegmentOnlineOfflineStateModel.onBecomeDroppedFromOffline() for table: "
+                + "{}, segment: {}",
+            message.getResourceName(), message.getPartitionName(), e);
+        throw e;
+      }
+    }
+
+    @Transition(from = "ONLINE", to = "DROPPED")
+    public void onBecomeDroppedFromOnline(Message message, NotificationContext context)
+        throws Exception {
+      _logger.info("SegmentOnlineOfflineStateModel.onBecomeDroppedFromOnline() : {}", message);
+
+      try {
+        String tableNameWithType = message.getResourceName();
+        String segmentName = message.getPartitionName();
+        _instanceDataManager.offloadSegment(tableNameWithType, segmentName);
+        _instanceDataManager.deleteSegment(tableNameWithType, segmentName);
+      } catch (Exception e) {
+        _logger.error(
+            "Caught exception while processing SegmentOnlineOfflineStateModel.onBecomeDroppedFromOnline() for table: "
+                + "{}, segment: {}",
+            message.getResourceName(), message.getPartitionName(), e);
+        throw e;
+      }
+    }
+
+    @Transition(from = "ERROR", to = "OFFLINE")
+    public void onBecomeOfflineFromError(Message message, NotificationContext context) {
+      _logger.info("SegmentOnlineOfflineStateModel.onBecomeOfflineFromError() : {}", message);
+    }
+
+    @Transition(from = "ERROR", to = "DROPPED")
+    public void onBecomeDroppedFromError(Message message, NotificationContext context)
+        throws Exception {
+      _logger.info("SegmentOnlineOfflineStateModel.onBecomeDroppedFromError() : {}", message);
+
+      try {
+        _instanceDataManager.deleteSegment(message.getResourceName(), message.getPartitionName());
+      } catch (Exception e) {
+        _logger.error(
+            "Caught exception while processing SegmentOnlineOfflineStateModel.onBecomeDroppedFromError() for table: "
+                + "{}, segment: {}",
+            message.getResourceName(), message.getPartitionName(), e);
+        throw e;
+      }
+    }
+  }
+
+  /// Get thread pool to handle the given state transition message.
+  /// If this method returns null, the threadpool returned from
+  /// [StateModelFactory#getExecutorService(String resourceName, String fromState, String toState)] will be used;
+  /// If this method returns null the threadpool returned from
+  /// [StateModelFactory#getExecutorService(String resourceName)] will be used.
+  /// If that method return null too, then the default shared threadpool will be used.
+  /// This method may be called only once for each category of messages,
+  /// it will NOT be called during each state transition.
+  /// @param messageInfo contains information used to categorize messages to use different threadpools
+  /// @return An object contains the MessageIdentifierBase and the assigned threadpool for the input message
+  @Override
+  @Nullable
+  public CustomizedExecutorService getExecutorService(Message.MessageInfo messageInfo) {
+    if (_stateTransitionThreadPoolManager == null) {
+      return super.getExecutorService(messageInfo);
+    }
+    return _stateTransitionThreadPoolManager.getExecutorService(messageInfo);
+  }
+
+  @Override
+  @Nullable
+  public ExecutorService getExecutorService(String resourceName, String fromState, String toState) {
+    if (_stateTransitionThreadPoolManager == null) {
+      return super.getExecutorService(resourceName, fromState, toState);
+    }
+    return _stateTransitionThreadPoolManager.getExecutorService(resourceName, fromState, toState);
+  }
+
+  @Override
+  @Nullable
+  public ExecutorService getExecutorService(String resourceName) {
+    if (_stateTransitionThreadPoolManager == null) {
+      return super.getExecutorService(resourceName);
+    }
+    return _stateTransitionThreadPoolManager.getExecutorService(resourceName);
+  }
+}

@@ -1,0 +1,433 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pinot.segment.spi.index.creator;
+
+import java.io.IOException;
+import java.math.BigDecimal;
+import java.util.Map;
+import javax.annotation.Nullable;
+import org.apache.pinot.segment.spi.compression.ChunkCompressionType;
+import org.apache.pinot.segment.spi.index.IndexCreator;
+import org.apache.pinot.spi.data.FieldSpec.DataType;
+import org.apache.pinot.spi.utils.MapUtils;
+
+
+/// Interface for forward index creator.
+public interface ForwardIndexCreator extends IndexCreator {
+
+  @Override
+  default void seal()
+      throws IOException {
+  }
+
+  @Override
+  default void add(Object cellValue, int dictId) {
+    if (isDictionaryEncoded()) {
+      putDictId(dictId);
+    } else {
+      switch (getValueType()) {
+        case INT:
+          putInt((int) cellValue);
+          break;
+        case LONG:
+          putLong((long) cellValue);
+          break;
+        case FLOAT:
+          putFloat((float) cellValue);
+          break;
+        case DOUBLE:
+          putDouble((double) cellValue);
+          break;
+        case BIG_DECIMAL:
+          putBigDecimal((BigDecimal) cellValue);
+          break;
+        case STRING:
+          putString((String) cellValue);
+          break;
+        case BYTES:
+          putBytes((byte[]) cellValue);
+          break;
+        case JSON:
+        case MAP:
+          if (cellValue instanceof String) {
+            putString((String) cellValue);
+          } else if (cellValue instanceof byte[]) {
+            putBytes((byte[]) cellValue);
+          } else if (cellValue instanceof Map) {
+            putBytes(MapUtils.serializeMap((Map<String, Object>) cellValue));
+          } else {
+            throw new IllegalStateException(
+                "Unsupported value type: " + getValueType() + ", cellValue type is: " + cellValue.getClass());
+          }
+          break;
+        default:
+          throw new IllegalStateException();
+      }
+    }
+  }
+
+  @Override
+  default void add(Object[] cellValues, @Nullable int[] dictIds) {
+    if (isDictionaryEncoded()) {
+      putDictIdMV(dictIds);
+    } else {
+      int length = cellValues.length;
+      // TODO: The new int[], long[], etc objects are not actually used as arrays iterated again, so we could skip the
+      //  array copy by calling an add(Object[]) method and having overloaded indexes for each type.
+      // TODO: Longer methods are not optimized by C2 JIT. We should try to move each loop to a specific method.
+      switch (getValueType()) {
+        case INT:
+          int[] ints = new int[length];
+          for (int i = 0; i < length; i++) {
+            ints[i] = (Integer) cellValues[i];
+          }
+          putIntMV(ints);
+          break;
+        case LONG:
+          long[] longs = new long[length];
+          for (int i = 0; i < length; i++) {
+            longs[i] = (Long) cellValues[i];
+          }
+          putLongMV(longs);
+          break;
+        case FLOAT:
+          float[] floats = new float[length];
+          for (int i = 0; i < length; i++) {
+            floats[i] = (Float) cellValues[i];
+          }
+          putFloatMV(floats);
+          break;
+        case DOUBLE:
+          double[] doubles = new double[length];
+          for (int i = 0; i < length; i++) {
+            doubles[i] = (Double) cellValues[i];
+          }
+          putDoubleMV(doubles);
+          break;
+        case BIG_DECIMAL:
+          if (cellValues instanceof BigDecimal[]) {
+            putBigDecimalMV((BigDecimal[]) cellValues);
+          } else {
+            BigDecimal[] bigDecimals = new BigDecimal[length];
+            for (int i = 0; i < length; i++) {
+              bigDecimals[i] = (BigDecimal) cellValues[i];
+            }
+            putBigDecimalMV(bigDecimals);
+          }
+          break;
+        case STRING:
+          if (cellValues instanceof String[]) {
+            putStringMV((String[]) cellValues);
+          } else {
+            String[] strings = new String[length];
+            for (int i = 0; i < length; i++) {
+              strings[i] = (String) cellValues[i];
+            }
+            putStringMV(strings);
+          }
+          break;
+        case BYTES:
+          if (cellValues instanceof byte[][]) {
+            putBytesMV((byte[][]) cellValues);
+          } else {
+            byte[][] bytesArray = new byte[length][];
+            for (int i = 0; i < length; i++) {
+              bytesArray[i] = (byte[]) cellValues[i];
+            }
+            putBytesMV(bytesArray);
+          }
+          break;
+        default:
+          throw new IllegalStateException();
+      }
+    }
+  }
+
+  /// Primitive type additions for columnar processing optimization.
+  /// These methods avoid boxing overhead when iterating over columnar data.
+  /// Default implementations delegate to putDictId or put\* methods based on dictId.
+
+  @Override
+  default void addInt(int value, int dictId) {
+    if (isDictionaryEncoded()) {
+      putDictId(dictId);
+    } else {
+      putInt(value);
+    }
+  }
+
+  @Override
+  default void addLong(long value, int dictId) {
+    if (isDictionaryEncoded()) {
+      putDictId(dictId);
+    } else {
+      putLong(value);
+    }
+  }
+
+  @Override
+  default void addFloat(float value, int dictId) {
+    if (isDictionaryEncoded()) {
+      putDictId(dictId);
+    } else {
+      putFloat(value);
+    }
+  }
+
+  @Override
+  default void addDouble(double value, int dictId) {
+    if (isDictionaryEncoded()) {
+      putDictId(dictId);
+    } else {
+      putDouble(value);
+    }
+  }
+
+  @Override
+  default void addBigDecimal(BigDecimal value, int dictId) {
+    if (isDictionaryEncoded()) {
+      putDictId(dictId);
+    } else {
+      putBigDecimal(value);
+    }
+  }
+
+  @Override
+  default void addString(String value, int dictId) {
+    if (isDictionaryEncoded()) {
+      putDictId(dictId);
+    } else {
+      putString(value);
+    }
+  }
+
+  @Override
+  default void addBytes(byte[] value, int dictId) {
+    if (isDictionaryEncoded()) {
+      putDictId(dictId);
+    } else {
+      putBytes(value);
+    }
+  }
+
+  @Override
+  default void addIntMV(int[] values, @Nullable int[] dictIds) {
+    if (isDictionaryEncoded()) {
+      putDictIdMV(dictIds);
+    } else {
+      putIntMV(values);
+    }
+  }
+
+  @Override
+  default void addLongMV(long[] values, @Nullable int[] dictIds) {
+    if (isDictionaryEncoded()) {
+      putDictIdMV(dictIds);
+    } else {
+      putLongMV(values);
+    }
+  }
+
+  @Override
+  default void addFloatMV(float[] values, @Nullable int[] dictIds) {
+    if (isDictionaryEncoded()) {
+      putDictIdMV(dictIds);
+    } else {
+      putFloatMV(values);
+    }
+  }
+
+  @Override
+  default void addDoubleMV(double[] values, @Nullable int[] dictIds) {
+    if (isDictionaryEncoded()) {
+      putDictIdMV(dictIds);
+    } else {
+      putDoubleMV(values);
+    }
+  }
+
+  @Override
+  default void addBigDecimalMV(BigDecimal[] values, @Nullable int[] dictIds) {
+    if (isDictionaryEncoded()) {
+      putDictIdMV(dictIds);
+    } else {
+      putBigDecimalMV(values);
+    }
+  }
+
+  @Override
+  default void addStringMV(String[] values, @Nullable int[] dictIds) {
+    if (isDictionaryEncoded()) {
+      putDictIdMV(dictIds);
+    } else {
+      putStringMV(values);
+    }
+  }
+
+  @Override
+  default void addBytesMV(byte[][] values, @Nullable int[] dictIds) {
+    if (isDictionaryEncoded()) {
+      putDictIdMV(dictIds);
+    } else {
+      putBytesMV(values);
+    }
+  }
+
+  /// Returns `true` if the forward index is dictionary-encoded, `false` if it is raw.
+  boolean isDictionaryEncoded();
+
+  /// Returns `true` if the forward index is for a single-value column, `false` if it is for a multi-value
+  /// column.
+  boolean isSingleValue();
+
+  /// Returns the data type of the values in the forward index. Returns [DataType#INT] for dictionary-encoded
+  /// forward index.
+  DataType getValueType();
+
+  /// Returns serialized value bytes presented to the raw forward-index chunk compressor, or `-1` when unavailable.
+  default long getRawForwardIndexUncompressedValueSizeInBytes() {
+    return -1;
+  }
+
+  /// Returns the chunk-compression type actually selected by this raw forward-index creator, or `null` when this
+  /// creator is dictionary encoded or does not expose compression statistics.
+  @Nullable
+  default ChunkCompressionType getRawForwardIndexChunkCompressionType() {
+    return null;
+  }
+
+  /// DICTIONARY-ENCODED INDEX APIs
+
+  /// Writes the dictionary id for the next single-value into the forward index.
+  ///
+  /// @param dictId Document id to write
+  default void putDictId(int dictId) {
+    throw new UnsupportedOperationException();
+  }
+
+  /// Writes the dictionary ids for the next multi-value into the forward index.
+  ///
+  /// @param dictIds Document ids to write
+  default void putDictIdMV(int[] dictIds) {
+    throw new UnsupportedOperationException();
+  }
+
+  /// SINGLE-VALUE COLUMN RAW INDEX APIs
+
+  /// Writes the next INT type single-value into the forward index.
+  ///
+  /// @param value Value to write
+  default void putInt(int value) {
+    throw new UnsupportedOperationException();
+  }
+
+  /// Writes the next LONG type single-value into the forward index.
+  ///
+  /// @param value Value to write
+  default void putLong(long value) {
+    throw new UnsupportedOperationException();
+  }
+
+  /// Writes the next FLOAT type single-value into the forward index.
+  ///
+  /// @param value Value to write
+  default void putFloat(float value) {
+    throw new UnsupportedOperationException();
+  }
+
+  /// Writes the next DOUBLE type single-value into the forward index.
+  ///
+  /// @param value Value to write
+  default void putDouble(double value) {
+    throw new UnsupportedOperationException();
+  }
+
+  /// Writes the next BIG_DECIMAL type single-value into the forward index.
+  ///
+  /// @param value Value to write
+  default void putBigDecimal(BigDecimal value) {
+    throw new UnsupportedOperationException();
+  }
+
+  /// Writes the next STRING type single-value into the forward index.
+  ///
+  /// @param value Value to write
+  default void putString(String value) {
+    throw new UnsupportedOperationException();
+  }
+
+  /// Writes the next BYTES type single-value into the forward index.
+  ///
+  /// @param value Value to write
+  default void putBytes(byte[] value) {
+    throw new UnsupportedOperationException();
+  }
+
+  /// MULTI-VALUE COLUMN RAW INDEX APIs
+  /// TODO: Not supported yet
+
+  /// Writes the next INT type multi-value into the forward index.
+  ///
+  /// @param values Values to write
+  default void putIntMV(int[] values) {
+    throw new UnsupportedOperationException();
+  }
+
+  /// Writes the next LONG type multi-value into the forward index.
+  ///
+  /// @param values Values to write
+  default void putLongMV(long[] values) {
+    throw new UnsupportedOperationException();
+  }
+
+  /// Writes the next FLOAT type multi-value into the forward index.
+  ///
+  /// @param values Values to write
+  default void putFloatMV(float[] values) {
+    throw new UnsupportedOperationException();
+  }
+
+  /// Writes the next DOUBLE type multi-value into the forward index.
+  ///
+  /// @param values Values to write
+  default void putDoubleMV(double[] values) {
+    throw new UnsupportedOperationException();
+  }
+
+  /// Writes the next BIG_DECIMAL type multi-value into the forward index.
+  ///
+  /// @param values Values to write
+  default void putBigDecimalMV(BigDecimal[] values) {
+    throw new UnsupportedOperationException();
+  }
+
+  /// Writes the next STRING type multi-value into the forward index.
+  ///
+  /// @param values Values to write
+  default void putStringMV(String[] values) {
+    throw new UnsupportedOperationException();
+  }
+
+  /// Writes the next byte\[\] type multi-value into the forward index.
+  ///
+  /// @param values Values to write
+  default void putBytesMV(byte[][] values) {
+    throw new UnsupportedOperationException();
+  }
+}

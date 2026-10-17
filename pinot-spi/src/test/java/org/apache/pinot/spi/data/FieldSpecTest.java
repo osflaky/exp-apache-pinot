@@ -1,0 +1,899 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pinot.spi.data;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import java.io.IOException;
+import java.math.BigDecimal;
+import java.sql.Timestamp;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+import java.util.concurrent.TimeUnit;
+import org.apache.pinot.spi.utils.ByteArray;
+import org.apache.pinot.spi.utils.JsonUtils;
+import org.apache.pinot.spi.utils.UuidUtils;
+import org.testng.Assert;
+import org.testng.annotations.DataProvider;
+import org.testng.annotations.Test;
+
+import static org.apache.pinot.spi.data.FieldSpec.DataType.*;
+import static org.assertj.core.api.Assertions.assertThat;
+
+
+/// Tests for [FieldSpec].
+public class FieldSpecTest {
+  private static final long RANDOM_SEED = System.currentTimeMillis();
+  private static final Random RANDOM = new Random(RANDOM_SEED);
+  private static final String ERROR_MESSAGE = "Random seed is: " + RANDOM_SEED;
+  private static final String UUID_VALUE = "550e8400-e29b-41d4-a716-446655440000";
+  private static final String LARGER_UUID_VALUE = "550e8400-e29b-41d4-a716-446655440001";
+
+  /// Test all [FieldSpec.DataType].
+  @Test
+  public void testDataType() {
+    Assert.assertEquals(INT.getStoredType(), INT);
+    Assert.assertEquals(LONG.getStoredType(), LONG);
+    Assert.assertEquals(FLOAT.getStoredType(), FLOAT);
+    Assert.assertEquals(DOUBLE.getStoredType(), DOUBLE);
+    Assert.assertEquals(BIG_DECIMAL.getStoredType(), BIG_DECIMAL);
+    Assert.assertEquals(BOOLEAN.getStoredType(), INT);
+    Assert.assertEquals(TIMESTAMP.getStoredType(), LONG);
+    Assert.assertEquals(STRING.getStoredType(), STRING);
+    Assert.assertEquals(JSON.getStoredType(), STRING);
+    Assert.assertEquals(BYTES.getStoredType(), BYTES);
+    Assert.assertEquals(UUID.getStoredType(), BYTES);
+
+    Assert.assertEquals(INT.size(), Integer.BYTES);
+    Assert.assertEquals(LONG.size(), Long.BYTES);
+    Assert.assertEquals(FLOAT.size(), Float.BYTES);
+    Assert.assertEquals(DOUBLE.size(), Double.BYTES);
+    Assert.assertEquals(BOOLEAN.size(), Integer.BYTES);
+    Assert.assertEquals(TIMESTAMP.size(), Long.BYTES);
+    Assert.assertEquals(UUID.size(), UuidUtils.UUID_NUM_BYTES);
+  }
+
+  /// Test all [FieldSpec.FieldType] with different [FieldSpec.DataType].
+  @Test
+  public void testFieldSpec() {
+    // Single-value boolean type dimension field with default null value.
+    FieldSpec fieldSpec1 = new DimensionFieldSpec();
+    fieldSpec1.setName("svDimension");
+    fieldSpec1.setDataType(BOOLEAN);
+    fieldSpec1.setDefaultNullValue(false);
+    FieldSpec fieldSpec2 = new DimensionFieldSpec("svDimension", BOOLEAN, true, false);
+    Assert.assertEquals(fieldSpec1, fieldSpec2);
+    Assert.assertEquals(fieldSpec1.toString(), fieldSpec2.toString());
+    Assert.assertEquals(fieldSpec1.hashCode(), fieldSpec2.hashCode());
+    Assert.assertEquals(fieldSpec1.getDefaultNullValue(), 0);
+
+    // Single-value timestamp type dimension field with default null value.
+    fieldSpec1 = new DimensionFieldSpec();
+    fieldSpec1.setName("svDimension");
+    fieldSpec1.setDataType(TIMESTAMP);
+    fieldSpec1.setDefaultNullValue(new Timestamp(0).toString());
+    fieldSpec2 = new DimensionFieldSpec("svDimension", TIMESTAMP, true, new Timestamp(0).toString());
+    Assert.assertEquals(fieldSpec1, fieldSpec2);
+    Assert.assertEquals(fieldSpec1.toString(), fieldSpec2.toString());
+    Assert.assertEquals(fieldSpec1.hashCode(), fieldSpec2.hashCode());
+    Assert.assertEquals(fieldSpec1.getDefaultNullValue(), 0L);
+
+    // Single-value string type dimension field with max length and default null value.
+    fieldSpec1 = new DimensionFieldSpec();
+    fieldSpec1.setName("svDimension");
+    fieldSpec1.setDataType(STRING);
+    fieldSpec1.setMaxLength(20000);
+    fieldSpec2 = new DimensionFieldSpec("svDimension", STRING, true, 20000, null);
+    Assert.assertEquals(fieldSpec1, fieldSpec2);
+    Assert.assertEquals(fieldSpec1.toString(), fieldSpec2.toString());
+    Assert.assertEquals(fieldSpec1.hashCode(), fieldSpec2.hashCode());
+    Assert.assertEquals(fieldSpec1.getDefaultNullValue(), "null");
+
+    // Single-value json type dimension field with max length and default null value.
+    fieldSpec1 = new DimensionFieldSpec();
+    fieldSpec1.setName("svDimension");
+    fieldSpec1.setDataType(JSON);
+    fieldSpec1.setMaxLength(20000);
+    fieldSpec2 = new DimensionFieldSpec("svDimension", JSON, true, 20000, null);
+    Assert.assertEquals(fieldSpec1, fieldSpec2);
+    Assert.assertEquals(fieldSpec1.toString(), fieldSpec2.toString());
+    Assert.assertEquals(fieldSpec1.hashCode(), fieldSpec2.hashCode());
+    Assert.assertEquals(fieldSpec1.getDefaultNullValue(), "null");
+
+    // Multi-value dimension field.
+    fieldSpec1 = new DimensionFieldSpec();
+    fieldSpec1.setName("mvDimension");
+    fieldSpec1.setDataType(INT);
+    fieldSpec1.setSingleValueField(false);
+    fieldSpec2 = new DimensionFieldSpec("mvDimension", INT, false);
+    Assert.assertEquals(fieldSpec1, fieldSpec2);
+    Assert.assertEquals(fieldSpec1.toString(), fieldSpec2.toString());
+    Assert.assertEquals(fieldSpec1.hashCode(), fieldSpec2.hashCode());
+    Assert.assertEquals(fieldSpec1.getDefaultNullValue(), Integer.MIN_VALUE);
+
+    // Multi-value dimension field with default null value.
+    fieldSpec1 = new DimensionFieldSpec();
+    fieldSpec1.setName("mvDimension");
+    fieldSpec1.setDataType(FLOAT);
+    fieldSpec1.setSingleValueField(false);
+    fieldSpec1.setDefaultNullValue(-0.1);
+    fieldSpec2 = new DimensionFieldSpec("mvDimension", FLOAT, false, -0.1);
+    Assert.assertEquals(fieldSpec1, fieldSpec2);
+    Assert.assertEquals(fieldSpec1.toString(), fieldSpec2.toString());
+    Assert.assertEquals(fieldSpec1.hashCode(), fieldSpec2.hashCode());
+    Assert.assertEquals(fieldSpec1.getDefaultNullValue(), -0.1F);
+
+    // Multi-value dimension field with max length and default null value.
+    fieldSpec1 = new DimensionFieldSpec();
+    fieldSpec1.setName("mvDimension");
+    fieldSpec1.setDataType(STRING);
+    fieldSpec1.setSingleValueField(false);
+    fieldSpec1.setMaxLength(20000);
+    fieldSpec2 = new DimensionFieldSpec("mvDimension", STRING, false, 20000, null);
+    Assert.assertEquals(fieldSpec1, fieldSpec2);
+    Assert.assertEquals(fieldSpec1.toString(), fieldSpec2.toString());
+    Assert.assertEquals(fieldSpec1.hashCode(), fieldSpec2.hashCode());
+    Assert.assertEquals(fieldSpec1.getDefaultNullValue(), "null");
+
+    // Metric field with default null value.
+    fieldSpec1 = new MetricFieldSpec();
+    fieldSpec1.setName("metric");
+    fieldSpec1.setDataType(LONG);
+    fieldSpec1.setDefaultNullValue(1);
+    fieldSpec2 = new MetricFieldSpec("metric", LONG, 1);
+    Assert.assertEquals(fieldSpec1, fieldSpec2);
+    Assert.assertEquals(fieldSpec1.toString(), fieldSpec2.toString());
+    Assert.assertEquals(fieldSpec1.hashCode(), fieldSpec2.hashCode());
+    Assert.assertEquals(fieldSpec1.getDefaultNullValue(), 1L);
+
+    // Single-value BigDecimal type dimension field with default null value.
+    fieldSpec1 = new MetricFieldSpec();
+    fieldSpec1.setName("svMetric");
+    fieldSpec1.setDataType(BIG_DECIMAL);
+    fieldSpec1.setDefaultNullValue(BigDecimal.ZERO);
+    fieldSpec2 = new MetricFieldSpec("svMetric", BIG_DECIMAL, BigDecimal.ZERO);
+    Assert.assertEquals(fieldSpec1, fieldSpec2);
+    Assert.assertEquals(fieldSpec1.toString(), fieldSpec2.toString());
+    Assert.assertEquals(fieldSpec1.hashCode(), fieldSpec2.hashCode());
+    Assert.assertEquals(fieldSpec1.getDefaultNullValue(), BigDecimal.ZERO);
+
+    // Single-value BigDecimal type dimension field with numeric default null value.
+    fieldSpec1 = new DimensionFieldSpec("bigDecimalDimension", BIG_DECIMAL, true, -1);
+    Assert.assertEquals(fieldSpec1.getDefaultNullValue(), new BigDecimal("-1"));
+    Assert.assertEquals(fieldSpec1.getDefaultNullValueString(), "-1");
+
+    // Metric field with default null value for byte column.
+    fieldSpec1 = new MetricFieldSpec();
+    fieldSpec1.setName("byteMetric");
+    fieldSpec1.setDataType(BYTES);
+    fieldSpec1.setDefaultNullValue(new byte[]{0x10, 0x20});
+    fieldSpec2 = new MetricFieldSpec("byteMetric", BYTES, new byte[]{0x10, 0x20});
+    Assert.assertEquals(fieldSpec1, fieldSpec2);
+    Assert.assertEquals(fieldSpec1.toJsonObject(), fieldSpec2.toJsonObject());
+    Assert.assertEquals(fieldSpec1.hashCode(), fieldSpec2.hashCode());
+    Assert.assertEquals(fieldSpec1.getDefaultNullValue(), fieldSpec2.getDefaultNullValue());
+
+    // Single-value uuid type dimension field with default null value.
+    fieldSpec1 = new DimensionFieldSpec();
+    fieldSpec1.setName("uuidDimension");
+    fieldSpec1.setDataType(UUID);
+    fieldSpec1.setDefaultNullValue(UUID_VALUE);
+    fieldSpec2 = new DimensionFieldSpec("uuidDimension", UUID, true, UUID_VALUE);
+    Assert.assertEquals(fieldSpec1, fieldSpec2);
+    Assert.assertEquals(fieldSpec1.toJsonObject(), fieldSpec2.toJsonObject());
+    Assert.assertEquals(fieldSpec1.hashCode(), fieldSpec2.hashCode());
+    assertThat((byte[]) fieldSpec1.getDefaultNullValue()).isEqualTo(UuidUtils.toBytes(UUID_VALUE));
+    Assert.assertEquals(fieldSpec1.getDefaultNullValueString(), UUID_VALUE);
+
+    FieldSpec uuidBytesFieldSpec =
+        new DimensionFieldSpec("uuidBytesDimension", UUID, true, UuidUtils.toBytes(UUID_VALUE));
+    assertThat((byte[]) uuidBytesFieldSpec.getDefaultNullValue()).isEqualTo(UuidUtils.toBytes(UUID_VALUE));
+    Assert.assertEquals(uuidBytesFieldSpec.getDefaultNullValueString(), UUID_VALUE);
+
+    FieldSpec defaultUuidFieldSpec = new DimensionFieldSpec("defaultUuidDimension", UUID, true);
+    byte[] firstDefaultNullValue = (byte[]) defaultUuidFieldSpec.getDefaultNullValue();
+    byte[] secondDefaultNullValue = (byte[]) defaultUuidFieldSpec.getDefaultNullValue();
+    assertThat(firstDefaultNullValue).isEqualTo(UuidUtils.nullUuidBytes());
+    assertThat(secondDefaultNullValue).isEqualTo(UuidUtils.nullUuidBytes());
+    // getDefaultNullValue() returns the stored default directly (no defensive copy); the default is never mutated.
+    Assert.assertSame(firstDefaultNullValue, secondDefaultNullValue);
+    Assert.assertEquals(defaultUuidFieldSpec.getDefaultNullValueString(), "00000000-0000-0000-0000-000000000000");
+  }
+
+  @Test
+  public void testUUIDConversions() {
+    byte[] uuidBytes = UuidUtils.toBytes(UUID_VALUE);
+    byte[] equalUuidBytes = UuidUtils.toBytes(UUID_VALUE);
+    byte[] largerUuidBytes = UuidUtils.toBytes(LARGER_UUID_VALUE);
+    String mixedCaseUuidValue = UUID_VALUE.toUpperCase();
+    ByteArray uuidInternal = new ByteArray(uuidBytes);
+
+    assertThat((byte[]) UUID.convert(UUID_VALUE)).isEqualTo(uuidBytes);
+    assertThat((byte[]) UUID.convert(mixedCaseUuidValue)).isEqualTo(uuidBytes);
+    Assert.assertEquals(UUID.convertInternal(UUID_VALUE), uuidInternal);
+    Assert.assertEquals(UUID.convertInternal(mixedCaseUuidValue), uuidInternal);
+    Assert.assertEquals(UUID.toString(uuidBytes), UUID_VALUE);
+    Assert.assertTrue(UUID.equals(uuidBytes, equalUuidBytes));
+    Assert.assertEquals(UUID.hashCode(uuidBytes), UUID.hashCode(equalUuidBytes));
+    Assert.assertEquals(UUID.compare(uuidBytes, equalUuidBytes), 0);
+    Assert.assertTrue(UUID.compare(uuidBytes, largerUuidBytes) < 0);
+    Assert.assertTrue(UUID.compare(largerUuidBytes, uuidBytes) > 0);
+  }
+
+  @Test
+  public void testInvalidUUIDConversion() {
+    IllegalArgumentException exception = Assert.expectThrows(IllegalArgumentException.class,
+        () -> UUID.convert("not-a-uuid"));
+    assertThat(exception).hasMessageContaining("Cannot convert value: 'not-a-uuid' to type: UUID");
+  }
+
+  @Test
+  public void testCompare() {
+    // BOOLEAN values are held as Integer (0/1) and TIMESTAMP as Long (epoch millis), so compare dispatches them
+    // through the INT and LONG cases respectively.
+    Assert.assertTrue(BOOLEAN.compare(0, 1) < 0);
+    Assert.assertTrue(BOOLEAN.compare(1, 0) > 0);
+    Assert.assertEquals(BOOLEAN.compare(1, 1), 0);
+    Assert.assertTrue(TIMESTAMP.compare(1000L, 2000L) < 0);
+    Assert.assertTrue(TIMESTAMP.compare(2000L, 1000L) > 0);
+    Assert.assertEquals(TIMESTAMP.compare(1000L, 1000L), 0);
+  }
+
+  /// Test [TimeFieldSpec] constructors.
+  @Test
+  public void testTimeFieldSpecConstructor() {
+    String incomingName = "incoming";
+    TimeUnit incomingTimeUnit = TimeUnit.HOURS;
+    int incomingTimeUnitSize = 1;
+    TimeGranularitySpec incomingTimeGranularitySpec =
+        new TimeGranularitySpec(LONG, incomingTimeUnitSize, incomingTimeUnit, incomingName);
+    String outgoingName = "outgoing";
+    TimeUnit outgoingTimeUnit = TimeUnit.DAYS;
+    int outgoingTimeUnitSize = 1;
+    TimeGranularitySpec outgoingTimeGranularitySpec =
+        new TimeGranularitySpec(INT, outgoingTimeUnitSize, outgoingTimeUnit, outgoingName);
+    TimeFieldSpec timeFieldSpec1 = new TimeFieldSpec(incomingTimeGranularitySpec);
+    TimeFieldSpec timeFieldSpec2 = new TimeFieldSpec(incomingTimeGranularitySpec, outgoingTimeGranularitySpec);
+    Assert.assertNotEquals(timeFieldSpec1, timeFieldSpec2);
+
+    timeFieldSpec1.setOutgoingGranularitySpec(outgoingTimeGranularitySpec);
+    Assert.assertEquals(timeFieldSpec1, timeFieldSpec2);
+  }
+
+  /// Test [DateTimeFieldSpec] constructors.
+  @Test
+  public void testDateTimeFieldSpecConstructor() {
+    String name = "Date";
+    String format = "1:HOURS:EPOCH";
+    String granularity = "1:HOURS";
+
+    DateTimeFieldSpec dateTimeFieldSpec1 = new DateTimeFieldSpec(name, LONG, format, granularity);
+    DateTimeFieldSpec dateTimeFieldSpec2 = new DateTimeFieldSpec(name, INT, format, granularity);
+    Assert.assertNotEquals(dateTimeFieldSpec2, dateTimeFieldSpec1);
+
+    DateTimeFieldSpec dateTimeFieldSpec3 = new DateTimeFieldSpec(name, LONG, format, granularity);
+    Assert.assertEquals(dateTimeFieldSpec1, dateTimeFieldSpec3);
+
+    DateTimeFieldSpec dateTimeFieldSpec4 = new DateTimeFieldSpec(name, LONG, format, granularity, 100000000L, null);
+    DateTimeFieldSpec dateTimeFieldSpec5 =
+        new DateTimeFieldSpec(name, INT, format, granularity, null, "toEpochHours(millis)");
+    Assert.assertNotEquals(dateTimeFieldSpec5, dateTimeFieldSpec4);
+
+    DateTimeFieldSpec dateTimeFieldSpec6 = new DateTimeFieldSpec(name, LONG, format, granularity, 100000000L, null);
+    Assert.assertEquals(dateTimeFieldSpec4, dateTimeFieldSpec6);
+  }
+
+  @Test(dataProvider = "testFormatDataProvider")
+  public void testDateTimeFormat(String name, FieldSpec.DataType dataType, String format, String granularity,
+      boolean exceptionExpected, DateTimeFieldSpec dateTimeFieldExpected) {
+
+    DateTimeFieldSpec dateTimeFieldActual = null;
+    boolean exceptionActual = false;
+    try {
+      dateTimeFieldActual = new DateTimeFieldSpec(name, dataType, format, granularity);
+    } catch (IllegalArgumentException e) {
+      exceptionActual = true;
+    }
+    Assert.assertEquals(exceptionActual, exceptionExpected);
+    Assert.assertEquals(dateTimeFieldActual, dateTimeFieldExpected);
+  }
+
+  @DataProvider(name = "testFormatDataProvider")
+  public Object[][] provideTestFormatData() {
+
+    String name = "Date";
+    FieldSpec.DataType dataType = LONG;
+    String granularity = "1:HOURS";
+
+    List<Object[]> entries = new ArrayList<>();
+    entries.add(new Object[]{name, dataType, "1:hours", granularity, true, null});
+    entries.add(new Object[]{name, dataType, "one_hours", granularity, true, null});
+    entries.add(new Object[]{name, dataType, "1:hour:EPOCH", granularity, true, null});
+    entries.add(new Object[]{name, dataType, "1:HOUR:EPOCH:yyyyMMdd", granularity, true, null});
+    entries.add(new Object[]{name, dataType, "0:HOURS:EPOCH", granularity, true, null});
+    entries.add(new Object[]{name, dataType, "-1:HOURS:EPOCH", granularity, true, null});
+    entries.add(new Object[]{name, dataType, "0.1:HOURS:EPOCH", granularity, true, null});
+    entries.add(new Object[]{
+        name, dataType, "1:HOURS:EPOCH", granularity, false,
+        new DateTimeFieldSpec(name, dataType, "1:HOURS:EPOCH", granularity)
+    });
+
+    entries.add(new Object[]{
+        name, dataType, "1:DAYS:SIMPLE_DATE_FORMAT", granularity, false,
+        new DateTimeFieldSpec(name, dataType, "1:DAYS:SIMPLE_DATE_FORMAT", granularity)
+    });
+
+    entries.add(new Object[]{
+        name, dataType, "1:DAYS:SIMPLE_DATE_FORMAT:yyyyMMdd", granularity, false,
+        new DateTimeFieldSpec(name, dataType, "1:DAYS:SIMPLE_DATE_FORMAT:yyyyMMdd", granularity)
+    });
+
+    return entries.toArray(new Object[entries.size()][]);
+  }
+
+  /// Test different order of fields in serialized JSON string to deserialize [FieldSpec].
+  @Test
+  public void testOrderOfFields()
+      throws Exception {
+    // Metric field with default null value.
+    String[] metricFields = {"\"name\":\"metric\"", "\"dataType\":\"INT\"", "\"defaultNullValue\":-1"};
+    MetricFieldSpec metricFieldSpec1 =
+        JsonUtils.stringToObject(getRandomOrderJsonString(metricFields), MetricFieldSpec.class);
+    MetricFieldSpec metricFieldSpec2 = new MetricFieldSpec("metric", INT, -1);
+    Assert.assertEquals(metricFieldSpec1, metricFieldSpec2, ERROR_MESSAGE);
+    Assert.assertEquals(metricFieldSpec1.getDefaultNullValue(), -1, ERROR_MESSAGE);
+
+    // Single-value boolean type dimension field with default null value.
+    String[] dimensionFields = {"\"name\":\"dimension\"", "\"dataType\":\"BOOLEAN\"", "\"defaultNullValue\":false"};
+    DimensionFieldSpec dimensionFieldSpec1 =
+        JsonUtils.stringToObject(getRandomOrderJsonString(dimensionFields), DimensionFieldSpec.class);
+    DimensionFieldSpec dimensionFieldSpec2 = new DimensionFieldSpec("dimension", BOOLEAN, true, false);
+    Assert.assertEquals(dimensionFieldSpec1, dimensionFieldSpec2, ERROR_MESSAGE);
+    Assert.assertEquals(dimensionFieldSpec1.getDefaultNullValue(), 0, ERROR_MESSAGE);
+
+    // Multi-value dimension field with default null value.
+    dimensionFields = new String[]{
+        "\"name\":\"dimension\"", "\"dataType\":\"STRING\"", "\"singleValueField\":false",
+        "\"defaultNullValue\":\"default\", \"maxLengthExceedStrategy\": \"TRIM_LENGTH\""
+    };
+    dimensionFieldSpec1 = JsonUtils.stringToObject(getRandomOrderJsonString(dimensionFields), DimensionFieldSpec.class);
+    dimensionFieldSpec2 = new DimensionFieldSpec("dimension", STRING, false, "default");
+    dimensionFieldSpec2.setMaxLengthExceedStrategy(FieldSpec.MaxLengthExceedStrategy.TRIM_LENGTH);
+    Assert.assertEquals(dimensionFieldSpec1, dimensionFieldSpec2, ERROR_MESSAGE);
+    Assert.assertEquals(dimensionFieldSpec1.getDefaultNullValue(), "default", ERROR_MESSAGE);
+
+    // Date time field with default null value.
+    String[] dateTimeFields = {
+        "\"name\":\"Date\"", "\"dataType\":\"LONG\"", "\"format\":\"1:MILLISECONDS:EPOCH\"",
+        "\"granularity\":\"5" + ":MINUTES\"", "\"dateTimeType\":\"PRIMARY\""
+    };
+    DateTimeFieldSpec dateTimeFieldSpec1 =
+        JsonUtils.stringToObject(getRandomOrderJsonString(dateTimeFields), DateTimeFieldSpec.class);
+    DateTimeFieldSpec dateTimeFieldSpec2 = new DateTimeFieldSpec("Date", LONG, "1:MILLISECONDS:EPOCH", "5:MINUTES");
+    Assert.assertEquals(dateTimeFieldSpec1, dateTimeFieldSpec2, ERROR_MESSAGE);
+  }
+
+  /// Test [FieldSpec] serialize deserialize.
+  @Test
+  public void testSerializeDeserialize()
+      throws Exception {
+    FieldSpec first;
+    FieldSpec second;
+
+    // Single-value boolean type dimension field with default null value.
+    String[] dimensionFields = {
+        "\"name\":\"dimension\"", "\"dataType\":\"BOOLEAN\"", "\"defaultNullValue\":false",
+        "\"transformFunction" + "\":\"trim(foo)\""
+    };
+    first = JsonUtils.stringToObject(getRandomOrderJsonString(dimensionFields), DimensionFieldSpec.class);
+    second = JsonUtils.stringToObject(first.toJsonObject().toString(), DimensionFieldSpec.class);
+    Assert.assertEquals(first, second, ERROR_MESSAGE);
+
+    // Multi-value dimension field with default null value.
+    dimensionFields = new String[]{
+        "\"name\":\"dimension\"", "\"dataType\":\"STRING\"", "\"singleValueField\":false",
+        "\"defaultNullValue\":\"default\""
+    };
+    first = JsonUtils.stringToObject(getRandomOrderJsonString(dimensionFields), DimensionFieldSpec.class);
+    second = JsonUtils.stringToObject(first.toJsonObject().toString(), DimensionFieldSpec.class);
+    Assert.assertEquals(first, second, ERROR_MESSAGE);
+
+    // Time field with default value.
+    String[] timeFields = {
+        "\"incomingGranularitySpec\":{\"timeUnitSize\":1, \"timeType\":\"MILLISECONDS\",\"dataType\":\"LONG\","
+            + "\"name\":\"incomingTime\"}",
+        "\"outgoingGranularitySpec\":{\"timeType\":\"SECONDS\",\"dataType\":\"INT\"," + "\"name\":\"outgoingTime\"}",
+        "\"defaultNullValue\":-1", "\"transformFunction\":\"toEpochDays" + "(millis)\""
+    };
+    first = JsonUtils.stringToObject(getRandomOrderJsonString(timeFields), TimeFieldSpec.class);
+    second = JsonUtils.stringToObject(first.toJsonObject().toString(), TimeFieldSpec.class);
+    Assert.assertEquals(first, second, ERROR_MESSAGE);
+
+    // DateTime field
+    String[] dateTimeFields = {
+        "\"name\":\"Date\"", "\"dataType\":\"LONG\"", "\"format\":\"1:MILLISECONDS:EPOCH\"",
+        "\"granularity\":\"5" + ":MINUTES\"", "\"transformFunction\":\"fromEpochDays(daysSinceEpoch)\""
+    };
+    first = JsonUtils.stringToObject(getRandomOrderJsonString(dateTimeFields), DateTimeFieldSpec.class);
+    second = JsonUtils.stringToObject(first.toJsonObject().toString(), DateTimeFieldSpec.class);
+    Assert.assertEquals(first, second, ERROR_MESSAGE);
+
+    // BigDecimal field
+    String[] metricFields = new String[]{
+        "\"name\":\"Salary\"", "\"dataType\":\"BIG_DECIMAL\""
+    };
+    first = JsonUtils.stringToObject(getRandomOrderJsonString(metricFields), MetricFieldSpec.class);
+    second = JsonUtils.stringToObject(first.toJsonObject().toString(), MetricFieldSpec.class);
+    Assert.assertEquals(first, second, ERROR_MESSAGE);
+  }
+
+  /// Helper function to generate JSON string with random order of fields passed in.
+  private String getRandomOrderJsonString(String[] fields) {
+    int length = fields.length;
+    List<Integer> indices = new LinkedList<>();
+    for (int i = 0; i < length; i++) {
+      indices.add(i);
+    }
+    StringBuilder jsonString = new StringBuilder();
+    jsonString.append('{');
+    for (int i = length; i > 0; i--) {
+      jsonString.append(fields[indices.remove(RANDOM.nextInt(i))]);
+      if (i != 1) {
+        jsonString.append(',');
+      }
+    }
+    jsonString.append('}');
+    return jsonString.toString();
+  }
+
+  @DataProvider(name = "nullableCases")
+  public static Object[][] nullableCases() {
+    return new Object[][] {
+        //            declared notNull, returned notNull
+        new Object[] {null},
+        new Object[] {false},
+        new Object[] {true}
+    };
+  }
+
+  @Test(dataProvider = "nullableCases")
+  void testNullability(Boolean declared)
+      throws IOException {
+    boolean expected = declared == Boolean.TRUE;
+    String json;
+    if (declared == null) {
+      json = "{\"name\": \"col1\", \"dataType\":\"BOOLEAN\"}";
+    } else {
+      json = "{\"name\": \"col1\", \"dataType\":\"BOOLEAN\", \"notNull\": " + declared + "}";
+    }
+    DimensionFieldSpec fieldSpec = JsonUtils.stringToObject(json, DimensionFieldSpec.class);
+
+    Assert.assertEquals(fieldSpec.isNotNull(), expected, "Unexpected notNull read when declared as " + declared);
+    Assert.assertEquals(fieldSpec.isNullable(), !expected, "Unexpected nullable read when declared as " + declared);
+  }
+
+  @Test(dataProvider = "nullableCases")
+  void testNullabilityIdempotency(Boolean declared)
+      throws JsonProcessingException {
+    String json;
+    if (declared == null) {
+      json = "{\"name\": \"col1\", \"dataType\":\"BOOLEAN\"}";
+    } else {
+      json = "{\"name\": \"col1\", \"dataType\":\"BOOLEAN\", \"notNull\": " + declared + "}";
+    }
+    DimensionFieldSpec fieldSpec = JsonUtils.stringToObject(json, DimensionFieldSpec.class);
+
+    String serialized = JsonUtils.objectToString(fieldSpec);
+    DimensionFieldSpec deserialized = JsonUtils.stringToObject(serialized, DimensionFieldSpec.class);
+
+    Assert.assertEquals(deserialized, fieldSpec, "Changes detected while checking serialize/deserialize idempotency");
+  }
+
+
+  /// Test to ensure only expected fields are serialized and @JsonIgnore methods are excluded.
+  /// This test verifies that getEffectiveMaxLength and getEffectiveMaxLengthExceedStrategy
+  /// (which are annotated with @JsonIgnore) do not appear in the JSON output.
+  @Test
+  public void testJsonSerializationExcludesIgnoredFields() throws Exception {
+    // Test DimensionFieldSpec with some null and some non-null values
+    DimensionFieldSpec dimensionFieldSpec = new DimensionFieldSpec("testDimension", STRING, true, 100, "defaultValue");
+    dimensionFieldSpec.setMaxLengthExceedStrategy(FieldSpec.MaxLengthExceedStrategy.TRIM_LENGTH);
+
+    String json = JsonUtils.objectToString(dimensionFieldSpec);
+
+    // Verify @JsonIgnore methods are not in JSON
+    Assert.assertFalse(json.contains("effectiveMaxLength"),
+        "JSON should not contain effectiveMaxLength (marked with @JsonIgnore): " + json);
+    Assert.assertFalse(json.contains("effectiveMaxLengthExceedStrategy"),
+        "JSON should not contain effectiveMaxLengthExceedStrategy (marked with @JsonIgnore): " + json);
+    Assert.assertFalse(json.contains("nullable"),
+        "JSON should not contain nullable (marked with @JsonIgnore): " + json);
+
+    // Verify expected fields are present
+    Assert.assertTrue(json.contains("\"name\":\"testDimension\""),
+        "JSON should contain name field: " + json);
+    Assert.assertTrue(json.contains("\"dataType\":\"STRING\""),
+        "JSON should contain dataType field: " + json);
+
+    // Test MetricFieldSpec with null values to ensure they're not serialized
+    MetricFieldSpec metricFieldSpec = new MetricFieldSpec("testMetric", INT);
+    // maxLength, maxLengthExceedStrategy, and transformFunction should be null
+
+    String metricJson = JsonUtils.objectToString(metricFieldSpec);
+
+    // Verify @JsonIgnore methods are not in JSON
+    Assert.assertFalse(metricJson.contains("effectiveMaxLength"),
+        "JSON should not contain effectiveMaxLength (marked with @JsonIgnore): " + metricJson);
+    Assert.assertFalse(metricJson.contains("effectiveMaxLengthExceedStrategy"),
+        "JSON should not contain effectiveMaxLengthExceedStrategy (marked with @JsonIgnore): " + metricJson);
+
+    // Verify null fields are not present (these should be null for a basic MetricFieldSpec)
+    Assert.assertFalse(metricJson.contains("maxLength"),
+        "JSON should not contain maxLength when it's null: " + metricJson);
+    Assert.assertFalse(metricJson.contains("maxLengthExceedStrategy"),
+        "JSON should not contain maxLengthExceedStrategy when it's null: " + metricJson);
+    Assert.assertFalse(metricJson.contains("transformFunction"),
+        "JSON should not contain transformFunction when it's null: " + metricJson);
+
+    // Verify expected fields are present
+    Assert.assertTrue(metricJson.contains("\"name\":\"testMetric\""),
+        "JSON should contain name field: " + metricJson);
+    Assert.assertTrue(metricJson.contains("\"dataType\":\"INT\""),
+        "JSON should contain dataType field: " + metricJson);
+    Assert.assertTrue(metricJson.contains("\"singleValueField\":true"),
+        "JSON should contain singleValueField field: " + metricJson);
+  }
+
+  @Test
+  public void testDescriptionAndTagsSerdeRoundtrip()
+      throws Exception {
+    DimensionFieldSpec fieldSpec = new DimensionFieldSpec("user_id", STRING, true);
+    fieldSpec.setDescription("Unique user identifier (UUID v4).");
+    fieldSpec.setTags(Arrays.asList("pii", "partition-key"));
+
+    // Verify toJsonObject() includes description and tags
+    String json = fieldSpec.toJsonObject().toString();
+    assertThat(json).contains("\"description\":\"Unique user identifier (UUID v4).\"");
+    assertThat(json).contains("\"tags\":[\"pii\",\"partition-key\"]");
+
+    // Roundtrip via toJsonObject()
+    DimensionFieldSpec deserialized = JsonUtils.stringToObject(json, DimensionFieldSpec.class);
+    assertThat(deserialized.getDescription()).isEqualTo("Unique user identifier (UUID v4).");
+    assertThat(deserialized.getTags()).isEqualTo(Arrays.asList("pii", "partition-key"));
+
+    // Jackson serde roundtrip
+    String jacksonJson = JsonUtils.objectToString(fieldSpec);
+    DimensionFieldSpec fromJackson = JsonUtils.stringToObject(jacksonJson, DimensionFieldSpec.class);
+    assertThat(fromJackson.getDescription()).isEqualTo("Unique user identifier (UUID v4).");
+    assertThat(fromJackson.getTags()).isEqualTo(Arrays.asList("pii", "partition-key"));
+  }
+
+  @Test
+  public void testDescriptionAndTagsOmittedWhenNotSet()
+      throws Exception {
+    DimensionFieldSpec fieldSpec = new DimensionFieldSpec("col1", INT, true);
+
+    // toJsonObject() path
+    String json = fieldSpec.toJsonObject().toString();
+    assertThat(json).as("description should be absent when null").doesNotContain("description");
+    assertThat(json).as("tags should be absent when null").doesNotContain("tags");
+
+    // Jackson path
+    String jacksonJson = JsonUtils.objectToString(fieldSpec);
+    assertThat(jacksonJson).as("description should be absent when null").doesNotContain("description");
+    assertThat(jacksonJson).as("tags should be absent when null").doesNotContain("tags");
+  }
+
+  @Test
+  public void testEmptyTagsOmittedFromJson()
+      throws Exception {
+    DimensionFieldSpec fieldSpec = new DimensionFieldSpec("col1", INT, true);
+    fieldSpec.setTags(List.of());
+
+    String json = fieldSpec.toJsonObject().toString();
+    assertThat(json).as("empty tags should be absent").doesNotContain("tags");
+
+    String jacksonJson = JsonUtils.objectToString(fieldSpec);
+    assertThat(jacksonJson).as("empty tags should be absent (Jackson)").doesNotContain("tags");
+  }
+
+  @Test
+  public void testOldJsonWithoutDescriptionDeserializesCleanly()
+      throws Exception {
+    String oldJson = "{\"name\":\"col1\",\"dataType\":\"STRING\"}";
+    DimensionFieldSpec fieldSpec = JsonUtils.stringToObject(oldJson, DimensionFieldSpec.class);
+    assertThat(fieldSpec.getDescription()).isNull();
+    assertThat(fieldSpec.getTags()).isNull();
+  }
+
+  @Test
+  public void testDescriptionAndTagsInEqualsAndHashCode() {
+    DimensionFieldSpec spec1 = new DimensionFieldSpec("col1", STRING, true);
+    DimensionFieldSpec spec2 = new DimensionFieldSpec("col1", STRING, true);
+    spec2.setDescription("some description");
+    spec2.setTags(Arrays.asList("tag1"));
+
+    assertThat(spec1).isNotEqualTo(spec2);
+    assertThat(spec1.hashCode()).isNotEqualTo(spec2.hashCode());
+
+    // Equal when both have the same description and tags
+    spec1.setDescription("some description");
+    spec1.setTags(Arrays.asList("tag1"));
+    assertThat(spec1).isEqualTo(spec2);
+    assertThat(spec1.hashCode()).isEqualTo(spec2.hashCode());
+  }
+
+  @Test
+  public void testDescriptionNotInBackwardCompatibility() {
+    DimensionFieldSpec oldSpec = new DimensionFieldSpec("col1", STRING, true);
+    DimensionFieldSpec newSpec = new DimensionFieldSpec("col1", STRING, true);
+    newSpec.setDescription("added description");
+    newSpec.setTags(Arrays.asList("new-tag"));
+
+    assertThat(newSpec.isBackwardCompatibleWith(oldSpec)).isTrue();
+  }
+
+  @Test
+  public void testFieldIdAndAliasesSerdeRoundtrip()
+      throws Exception {
+    DimensionFieldSpec fieldSpec = new DimensionFieldSpec("user_id", STRING, true);
+    fieldSpec.setFieldId(42);
+    fieldSpec.setAliases(Arrays.asList("uid", "userId"));
+
+    String json = fieldSpec.toJsonObject().toString();
+    assertThat(json).contains("\"fieldId\":42");
+    assertThat(json).contains("\"aliases\":[\"uid\",\"userId\"]");
+
+    DimensionFieldSpec deserialized = JsonUtils.stringToObject(json, DimensionFieldSpec.class);
+    assertThat(deserialized.getFieldId()).isEqualTo(42);
+    assertThat(deserialized.getAliases()).isEqualTo(Arrays.asList("uid", "userId"));
+
+    String jacksonJson = JsonUtils.objectToString(fieldSpec);
+    DimensionFieldSpec fromJackson = JsonUtils.stringToObject(jacksonJson, DimensionFieldSpec.class);
+    assertThat(fromJackson.getFieldId()).isEqualTo(42);
+    assertThat(fromJackson.getAliases()).isEqualTo(Arrays.asList("uid", "userId"));
+  }
+
+  @Test
+  public void testFieldIdAndAliasesOmittedWhenNotSet()
+      throws Exception {
+    DimensionFieldSpec fieldSpec = new DimensionFieldSpec("col1", INT, true);
+
+    String json = fieldSpec.toJsonObject().toString();
+    assertThat(json).as("fieldId should be absent when null").doesNotContain("fieldId");
+    assertThat(json).as("aliases should be absent when null").doesNotContain("aliases");
+
+    String jacksonJson = JsonUtils.objectToString(fieldSpec);
+    assertThat(jacksonJson).as("fieldId should be absent when null").doesNotContain("fieldId");
+    assertThat(jacksonJson).as("aliases should be absent when null").doesNotContain("aliases");
+  }
+
+  @Test
+  public void testEmptyAliasesOmittedFromJson()
+      throws Exception {
+    DimensionFieldSpec fieldSpec = new DimensionFieldSpec("col1", INT, true);
+    fieldSpec.setAliases(List.of());
+    assertThat(fieldSpec.getAliases()).isNull();
+
+    String json = fieldSpec.toJsonObject().toString();
+    assertThat(json).as("empty aliases should be absent").doesNotContain("aliases");
+    assertThat(JsonUtils.stringToObject(json, DimensionFieldSpec.class)).isEqualTo(fieldSpec);
+
+    String jacksonJson = JsonUtils.objectToString(fieldSpec);
+    assertThat(jacksonJson).as("empty aliases should be absent (Jackson)").doesNotContain("aliases");
+    assertThat(JsonUtils.stringToObject(jacksonJson, DimensionFieldSpec.class)).isEqualTo(fieldSpec);
+  }
+
+  @Test
+  public void testTimeFieldSpecRoundTripsFieldIdAndAliasesThroughSchema()
+      throws Exception {
+    // TimeFieldSpec.toJsonObject() builds its JSON without calling super.toJsonObject(), so ensure the
+    // generic fieldId/aliases still round-trip through schema (de)serialization for legacy TIME columns.
+    TimeFieldSpec timeFieldSpec = new TimeFieldSpec(new TimeGranularitySpec(LONG, TimeUnit.DAYS, "ts"));
+    timeFieldSpec.setFieldId(7);
+    timeFieldSpec.setAliases(Arrays.asList("event_ts", "ingestion_ts"));
+
+    Schema schema = new Schema();
+    schema.setSchemaName("ts_schema");
+    schema.addField(timeFieldSpec);
+
+    String json = schema.toSingleLineJsonString();
+    assertThat(json).contains("\"fieldId\":7");
+    assertThat(json).contains("\"aliases\":[\"event_ts\",\"ingestion_ts\"]");
+
+    FieldSpec deserialized = Schema.fromString(json).getFieldSpecFor("ts");
+    assertThat(deserialized.getFieldId()).isEqualTo(7);
+    assertThat(deserialized.getAliases()).isEqualTo(Arrays.asList("event_ts", "ingestion_ts"));
+  }
+
+  @Test
+  public void testOldJsonWithoutFieldIdAndAliasesDeserializesCleanly()
+      throws Exception {
+    String oldJson = "{\"name\":\"col1\",\"dataType\":\"STRING\"}";
+    DimensionFieldSpec fieldSpec = JsonUtils.stringToObject(oldJson, DimensionFieldSpec.class);
+    assertThat(fieldSpec.getFieldId()).isNull();
+    assertThat(fieldSpec.getAliases()).isNull();
+  }
+
+  @Test
+  public void testFieldIdAndAliasesInEqualsAndHashCode() {
+    DimensionFieldSpec spec1 = new DimensionFieldSpec("col1", STRING, true);
+    DimensionFieldSpec spec2 = new DimensionFieldSpec("col1", STRING, true);
+    spec2.setFieldId(42);
+    spec2.setAliases(Arrays.asList("uid"));
+
+    assertThat(spec1).isNotEqualTo(spec2);
+    assertThat(spec1.hashCode()).isNotEqualTo(spec2.hashCode());
+
+    spec1.setFieldId(42);
+    spec1.setAliases(Arrays.asList("uid"));
+    assertThat(spec1).isEqualTo(spec2);
+    assertThat(spec1.hashCode()).isEqualTo(spec2.hashCode());
+  }
+
+  @Test
+  public void testFieldIdAndAliasesNotInBackwardCompatibility() {
+    DimensionFieldSpec oldSpec = new DimensionFieldSpec("col1", STRING, true);
+    DimensionFieldSpec newSpec = new DimensionFieldSpec("col1", STRING, true);
+    newSpec.setFieldId(42);
+    newSpec.setAliases(Arrays.asList("uid"));
+
+    assertThat(newSpec.isBackwardCompatibleWith(oldSpec)).isTrue();
+  }
+
+  @Test
+  public void testMetadataSerdeRoundtrip()
+      throws Exception {
+    DimensionFieldSpec fieldSpec = new DimensionFieldSpec("addr", JSON, true);
+    fieldSpec.setMetadata(Map.of("2", "person"));
+
+    String json = fieldSpec.toJsonObject().toString();
+    assertThat(json).contains("\"metadata\":{\"2\":\"person\"}");
+
+    DimensionFieldSpec deserialized = JsonUtils.stringToObject(json, DimensionFieldSpec.class);
+    assertThat(deserialized.getMetadata()).isEqualTo(Map.of("2", "person"));
+
+    String jacksonJson = JsonUtils.objectToString(fieldSpec);
+    DimensionFieldSpec fromJackson = JsonUtils.stringToObject(jacksonJson, DimensionFieldSpec.class);
+    assertThat(fromJackson.getMetadata()).isEqualTo(Map.of("2", "person"));
+  }
+
+  @Test
+  public void testMetadataOmittedWhenNotSet()
+      throws Exception {
+    DimensionFieldSpec fieldSpec = new DimensionFieldSpec("col1", INT, true);
+
+    String json = fieldSpec.toJsonObject().toString();
+    assertThat(json).as("metadata should be absent when null").doesNotContain("metadata");
+
+    String jacksonJson = JsonUtils.objectToString(fieldSpec);
+    assertThat(jacksonJson).as("metadata should be absent when null").doesNotContain("metadata");
+  }
+
+  @Test
+  public void testEmptyMetadataOmittedFromJson()
+      throws Exception {
+    DimensionFieldSpec fieldSpec = new DimensionFieldSpec("col1", INT, true);
+    fieldSpec.setMetadata(Map.of());
+    assertThat(fieldSpec.getMetadata()).as("empty metadata normalizes to null").isNull();
+
+    String json = fieldSpec.toJsonObject().toString();
+    assertThat(json).as("empty metadata should be absent").doesNotContain("metadata");
+    assertThat(JsonUtils.stringToObject(json, DimensionFieldSpec.class)).isEqualTo(fieldSpec);
+
+    String jacksonJson = JsonUtils.objectToString(fieldSpec);
+    assertThat(jacksonJson).as("empty metadata absent (Jackson)").doesNotContain("metadata");
+    assertThat(JsonUtils.stringToObject(jacksonJson, DimensionFieldSpec.class)).isEqualTo(fieldSpec);
+  }
+
+  @Test
+  public void testTimeFieldSpecRoundTripsMetadataThroughSchema()
+      throws Exception {
+    // TimeFieldSpec.toJsonObject() builds its JSON via the shared appendFieldIdAndAliases helper;
+    // ensure metadata round-trips through schema (de)serialization for legacy TIME columns too.
+    TimeFieldSpec timeFieldSpec = new TimeFieldSpec(new TimeGranularitySpec(LONG, TimeUnit.DAYS, "ts"));
+    timeFieldSpec.setMetadata(Map.of("7", "event_ts"));
+
+    Schema schema = new Schema();
+    schema.setSchemaName("ts_schema");
+    schema.addField(timeFieldSpec);
+
+    String json = schema.toSingleLineJsonString();
+    assertThat(json).contains("\"metadata\":{\"7\":\"event_ts\"}");
+
+    FieldSpec deserialized = Schema.fromString(json).getFieldSpecFor("ts");
+    assertThat(deserialized.getMetadata()).isEqualTo(Map.of("7", "event_ts"));
+  }
+
+  @Test
+  public void testOldJsonWithoutMetadataDeserializesCleanly()
+      throws Exception {
+    String oldJson = "{\"name\":\"col1\",\"dataType\":\"STRING\"}";
+    DimensionFieldSpec fieldSpec = JsonUtils.stringToObject(oldJson, DimensionFieldSpec.class);
+    assertThat(fieldSpec.getMetadata()).isNull();
+  }
+
+  @Test
+  public void testMetadataInEqualsAndHashCode() {
+    DimensionFieldSpec spec1 = new DimensionFieldSpec("col1", JSON, true);
+    DimensionFieldSpec spec2 = new DimensionFieldSpec("col1", JSON, true);
+    spec2.setMetadata(Map.of("2", "person"));
+
+    assertThat(spec1).isNotEqualTo(spec2);
+    assertThat(spec1.hashCode()).isNotEqualTo(spec2.hashCode());
+
+    spec1.setMetadata(Map.of("2", "person"));
+    assertThat(spec1).isEqualTo(spec2);
+    assertThat(spec1.hashCode()).isEqualTo(spec2.hashCode());
+  }
+
+  @Test
+  public void testMetadataNotInBackwardCompatibility() {
+    DimensionFieldSpec oldSpec = new DimensionFieldSpec("col1", JSON, true);
+    DimensionFieldSpec newSpec = new DimensionFieldSpec("col1", JSON, true);
+    newSpec.setMetadata(Map.of("2", "person"));
+
+    assertThat(newSpec.isBackwardCompatibleWith(oldSpec)).isTrue();
+  }
+
+  @Test
+  public void testComplexFieldSpecEqualsAndHashCode() {
+    Map<String, FieldSpec> children = new LinkedHashMap<>();
+    children.put("a", new DimensionFieldSpec("a", INT, true));
+    children.put("b", new DimensionFieldSpec("b", STRING, true));
+    ComplexFieldSpec first = new ComplexFieldSpec("nested", MAP, true, children);
+    Map<String, FieldSpec> reversed = new LinkedHashMap<>();
+    reversed.put("b", new DimensionFieldSpec("b", STRING, true));
+    reversed.put("a", new DimensionFieldSpec("a", INT, true));
+    ComplexFieldSpec second = new ComplexFieldSpec("nested", MAP, true, reversed);
+    assertThat(first).isEqualTo(first).isEqualTo(second).isNotEqualTo(null)
+        .isNotEqualTo(new DimensionFieldSpec("nested", STRING, true));
+    assertThat(second).isEqualTo(first);
+    assertThat(first.hashCode()).isEqualTo(second.hashCode());
+    assertThat(new HashSet<>(List.of(first))).contains(second);
+
+    second.setDescription("different parent");
+    assertThat(first).isNotEqualTo(second);
+    second.setDescription(null);
+    second.getChildFieldSpecs().remove("b");
+    assertThat(first).isNotEqualTo(second);
+    second.getChildFieldSpecs().put("b", new DimensionFieldSpec("b", LONG, true));
+    assertThat(first).isNotEqualTo(second);
+  }
+
+  @Test
+  public void testComplexFieldSpecEqualityIncludesNestedChildren() {
+    DimensionFieldSpec firstLeaf = new DimensionFieldSpec("value", INT, true, -1);
+    DimensionFieldSpec secondLeaf = new DimensionFieldSpec("value", INT, true, -1);
+    ComplexFieldSpec first = new ComplexFieldSpec("root", MAP, true,
+        Map.of("nested", new ComplexFieldSpec("nested", MAP, true, Map.of("value", firstLeaf))));
+    ComplexFieldSpec second = new ComplexFieldSpec("root", MAP, true,
+        Map.of("nested", new ComplexFieldSpec("nested", MAP, true, Map.of("value", secondLeaf))));
+    assertThat(first).isEqualTo(second);
+    assertThat(first.hashCode()).isEqualTo(second.hashCode());
+    secondLeaf.setDefaultNullValue(-2);
+    assertThat(first).isNotEqualTo(second);
+    assertThat(first.hashCode()).isNotEqualTo(second.hashCode());
+  }
+}

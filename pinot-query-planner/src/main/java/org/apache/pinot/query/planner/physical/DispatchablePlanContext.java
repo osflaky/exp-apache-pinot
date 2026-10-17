@@ -1,0 +1,248 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pinot.query.planner.physical;
+
+import com.google.common.base.Preconditions;
+import com.google.common.collect.Maps;
+import com.google.common.collect.Sets;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Queue;
+import java.util.Set;
+import javax.annotation.Nullable;
+import org.apache.calcite.runtime.PairList;
+import org.apache.pinot.common.utils.config.QueryOptionsUtils;
+import org.apache.pinot.query.context.PlannerContext;
+import org.apache.pinot.query.planner.PlanFragment;
+import org.apache.pinot.query.planner.plannode.PlanNode;
+import org.apache.pinot.query.routing.MailboxInfos;
+import org.apache.pinot.query.routing.QueryServerInstance;
+import org.apache.pinot.query.routing.WorkerManager;
+import org.apache.pinot.query.routing.WorkerMetadata;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+
+public class DispatchablePlanContext {
+  private static final Logger LOGGER = LoggerFactory.getLogger(DispatchablePlanContext.class);
+
+  private final WorkerManager _workerManager;
+  private final long _requestId;
+  private final PlannerContext _plannerContext;
+  private final PairList<Integer, String> _resultFields;
+  private final Set<String> _tableNames;
+
+  @Nullable
+  private final Set<String> _nonLookupTables;
+  @Nullable
+  private final Set<QueryServerInstance> _leafServerInstances;
+
+  private final Map<Integer, DispatchablePlanMetadata> _dispatchablePlanMetadataMap = new HashMap<>();
+  private final Map<Integer, PlanNode> _dispatchablePlanStageRootMap = new HashMap<>();
+  private final Map<String, WorkerManager.PartitionTableInfo> _partitionTableInfoCache = new HashMap<>();
+  private final Map<Integer, Set<String>> _prunedSegmentsCache = new HashMap<>();
+  private long _numSegmentsPrunedByBroker;
+  private int _leafStagesAssigned;
+  private int _leafStagesEmpty;
+
+
+  public DispatchablePlanContext(WorkerManager workerManager, long requestId, PlannerContext plannerContext,
+      PairList<Integer, String> resultFields, Set<String> tableNames) {
+    _workerManager = workerManager;
+    _requestId = requestId;
+    _plannerContext = plannerContext;
+    _resultFields = resultFields;
+    _tableNames = tableNames;
+
+    if (QueryOptionsUtils.isUseLeafServerForIntermediateStage(plannerContext.getOptions(),
+        plannerContext.getEnvConfig().defaultUseLeafServerForIntermediateStage())) {
+      // Use only leaf servers for intermediate stages
+      _leafServerInstances = new HashSet<>();
+      _nonLookupTables = null;
+    } else {
+      // Use all servers (excluding lookup tables) for intermediate stages
+      _leafServerInstances = null;
+      _nonLookupTables = Sets.newHashSetWithExpectedSize(tableNames.size());
+    }
+  }
+
+  public WorkerManager getWorkerManager() {
+    return _workerManager;
+  }
+
+  public long getRequestId() {
+    return _requestId;
+  }
+
+  public PlannerContext getPlannerContext() {
+    return _plannerContext;
+  }
+
+  public PairList<Integer, String> getResultFields() {
+    return _resultFields;
+  }
+
+  // Returns all the table names.
+  public Set<String> getTableNames() {
+    return _tableNames;
+  }
+
+  /// Returns `true` if we want to use servers for leaf stages as the workers for the intermediate stages.
+  public boolean isUseLeafServerForIntermediateStage() {
+    return _nonLookupTables == null;
+  }
+
+  /// Tracks non-lookup tables queried in leaf stages, which are used to determine the servers to use for intermediate
+  /// stages. Should be used only when leaf servers are NOT directly used for intermediate stages.
+  public Set<String> getNonLookupTables() {
+    assert !isUseLeafServerForIntermediateStage();
+    return _nonLookupTables;
+  }
+
+  /// Tracks servers that are used for leaf stages, which are used to determine the servers to use for intermediate
+  /// stages. Should be used only when leaf servers are directly used for intermediate stages.
+  public Set<QueryServerInstance> getLeafServerInstances() {
+    assert isUseLeafServerForIntermediateStage();
+    return _leafServerInstances;
+  }
+
+  public Map<Integer, DispatchablePlanMetadata> getDispatchablePlanMetadataMap() {
+    return _dispatchablePlanMetadataMap;
+  }
+
+  public Map<Integer, PlanNode> getDispatchablePlanStageRootMap() {
+    return _dispatchablePlanStageRootMap;
+  }
+
+  /// The partition layout of each partitioned table scanned by this query, keyed by table name. Read from the routing
+  /// manager once per table so that the colocation pre-pass and every leaf stage scanning the same table (e.g. both
+  /// sides of a self-join) see one snapshot. The value is opaque here: [WorkerManager] builds and interprets it.
+  public Map<String, WorkerManager.PartitionTableInfo> getPartitionTableInfoCache() {
+    return _partitionTableInfoCache;
+  }
+
+  /// The segments the broker's pruners provably eliminated for each leaf fragment, keyed by fragment id. Keyed by
+  /// fragment rather than by table because the verdict depends on the leaf's own filter, and the two sides of a
+  /// self-join scan one table under two different ones. Cached because the colocation pre-pass and the leaf
+  /// assignment both need it, and each entry costs a routing call.
+  public Map<Integer, Set<String>> getPrunedSegmentsCache() {
+    return _prunedSegmentsCache;
+  }
+
+  public long getNumSegmentsPrunedByBroker() {
+    return _numSegmentsPrunedByBroker;
+  }
+
+  public void addNumSegmentsPrunedByBroker(long count) {
+    _numSegmentsPrunedByBroker += count;
+  }
+
+  public void recordLeafStageAssigned() {
+    _leafStagesAssigned++;
+  }
+
+  public void recordLeafStageEmpty() {
+    _leafStagesEmpty++;
+  }
+
+  /// Returns true when at least one non-replicated leaf stage was processed during worker
+  /// assignment, and every such leaf stage ended up with zero workers (e.g. all segments
+  /// pruned by broker, or the table has no segments). Replicated leaves (dim tables) are
+  /// excluded because they return early in WorkerManager before reaching the tracking code.
+  public boolean isAllNonReplicatedLeafStagesEmpty() {
+    return _leafStagesAssigned > 0 && _leafStagesAssigned == _leafStagesEmpty;
+  }
+
+  public Map<Integer, DispatchablePlanFragment> constructDispatchablePlanFragmentMap(PlanFragment subPlanRoot) {
+    Map<Integer, DispatchablePlanFragment> dispatchablePlanFragmentMap = createDispatchablePlanFragmentMap(subPlanRoot);
+    for (Map.Entry<Integer, DispatchablePlanMetadata> planMetadataEntry : _dispatchablePlanMetadataMap.entrySet()) {
+      int stageId = planMetadataEntry.getKey();
+      DispatchablePlanMetadata dispatchablePlanMetadata = planMetadataEntry.getValue();
+
+      // construct each worker metadata
+      Map<Integer, QueryServerInstance> workerIdToServerInstanceMap =
+          dispatchablePlanMetadata.getWorkerIdToServerInstanceMap();
+      Map<Integer, Map<String, List<String>>> workerIdToSegmentsMap =
+          dispatchablePlanMetadata.getWorkerIdToSegmentsMap();
+      Map<Integer, Map<String, List<String>>> workerIdToTableNameSegmentsMap =
+          dispatchablePlanMetadata.getWorkerIdToTableSegmentsMap();
+      Map<Integer, Map<Integer, MailboxInfos>> workerIdToMailboxesMap =
+          dispatchablePlanMetadata.getWorkerIdToMailboxesMap();
+      Preconditions.checkArgument(workerIdToSegmentsMap == null || workerIdToTableNameSegmentsMap == null,
+          "Both workerIdToSegmentsMap and workerIdToTableNameSegmentsMap cannot be set at the same time");
+      Map<QueryServerInstance, List<Integer>> serverInstanceToWorkerIdsMap = new HashMap<>();
+      WorkerMetadata[] workerMetadataArray = new WorkerMetadata[workerIdToServerInstanceMap.size()];
+      for (Map.Entry<Integer, QueryServerInstance> serverEntry : workerIdToServerInstanceMap.entrySet()) {
+        int workerId = serverEntry.getKey();
+        QueryServerInstance queryServerInstance = serverEntry.getValue();
+        serverInstanceToWorkerIdsMap.computeIfAbsent(queryServerInstance, k -> new ArrayList<>()).add(workerId);
+        WorkerMetadata workerMetadata = new WorkerMetadata(workerId, workerIdToMailboxesMap.get(workerId));
+        if (workerIdToSegmentsMap != null) {
+          workerMetadata.setTableSegmentsMap(workerIdToSegmentsMap.get(workerId));
+        }
+        if (workerIdToTableNameSegmentsMap != null) {
+          workerMetadata.setLogicalTableSegmentsMap(workerIdToTableNameSegmentsMap.get(workerId));
+        }
+        workerMetadataArray[workerId] = workerMetadata;
+      }
+
+      // set the stageMetadata
+      DispatchablePlanFragment dispatchablePlanFragment = dispatchablePlanFragmentMap.get(stageId);
+      dispatchablePlanFragment.setWorkerMetadataList(Arrays.asList(workerMetadataArray));
+      if (workerIdToSegmentsMap != null) {
+        dispatchablePlanFragment.setWorkerIdToSegmentsMap(workerIdToSegmentsMap);
+      }
+      dispatchablePlanFragment.setServerInstanceToWorkerIdMap(serverInstanceToWorkerIdsMap);
+      Preconditions.checkState(dispatchablePlanMetadata.getScannedTables().size() <= 1,
+          "More than one table is not supported yet");
+      if (dispatchablePlanMetadata.getScannedTables().size() == 1) {
+        dispatchablePlanFragment.setTableName(dispatchablePlanMetadata.getScannedTables().get(0));
+      }
+      if (dispatchablePlanMetadata.getTimeBoundaryInfo() != null) {
+        dispatchablePlanFragment.setTimeBoundaryInfo(dispatchablePlanMetadata.getTimeBoundaryInfo());
+      }
+    }
+    return dispatchablePlanFragmentMap;
+  }
+
+  private Map<Integer, DispatchablePlanFragment> createDispatchablePlanFragmentMap(PlanFragment planFragmentRoot) {
+    HashMap<Integer, DispatchablePlanFragment> result =
+        Maps.newHashMapWithExpectedSize(_dispatchablePlanMetadataMap.size());
+    Queue<PlanFragment> pendingPlanFragmentIds = new ArrayDeque<>();
+    pendingPlanFragmentIds.add(planFragmentRoot);
+    while (!pendingPlanFragmentIds.isEmpty()) {
+      PlanFragment planFragment = pendingPlanFragmentIds.poll();
+      int planFragmentId = planFragment.getFragmentId();
+
+      if (result.containsKey(planFragmentId)) { // this can happen if some stage is spooled.
+        LOGGER.debug("Skipping already visited stage {}", planFragmentId);
+        continue;
+      }
+      result.put(planFragmentId, new DispatchablePlanFragment(planFragment));
+
+      pendingPlanFragmentIds.addAll(planFragment.getChildren());
+    }
+    return result;
+  }
+}

@@ -1,0 +1,156 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pinot.query.mailbox;
+
+import java.util.List;
+import org.apache.pinot.common.datatable.StatMap;
+import org.apache.pinot.query.runtime.blocks.ErrorMseBlock;
+import org.apache.pinot.query.runtime.blocks.MseBlock;
+import org.apache.pinot.query.runtime.operator.MailboxSendOperator;
+import org.apache.pinot.segment.spi.memory.DataBuffer;
+import org.apache.pinot.spi.exception.QueryCancelledException;
+import org.apache.pinot.spi.query.QueryThreadContext;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+
+public class InMemorySendingMailbox implements SendingMailbox {
+  private static final Logger LOGGER = LoggerFactory.getLogger(InMemorySendingMailbox.class);
+  private static final String SEND_SCOPE = "InMemorySendingMailbox";
+
+  private final String _id;
+  private final MailboxService _mailboxService;
+  private final long _deadlineMs;
+
+  private ReceivingMailbox _receivingMailbox;
+
+  /// Set to true when the send operation completes calling [#complete()]
+  private volatile boolean _isTerminated;
+
+  /// Set to true when the receiver waits for EOS but discards any further data blocks.
+  /// This can happen when the receiver has already early terminated, for example,
+  /// when the [org.apache.pinot.query.runtime.operator.SortOperator] limit has been reached.
+  private volatile boolean _isEarlyTerminated;
+  private final StatMap<MailboxSendOperator.StatKey> _statMap;
+
+  public InMemorySendingMailbox(String id, MailboxService mailboxService, long deadlineMs,
+      StatMap<MailboxSendOperator.StatKey> statMap) {
+    _id = id;
+    _mailboxService = mailboxService;
+    _deadlineMs = deadlineMs;
+    _statMap = statMap;
+  }
+
+  @Override
+  public boolean isLocal() {
+    return true;
+  }
+
+  @Override
+  public boolean deliversByReference() {
+    // Blocks are offered to the receiving mailbox as they are, so the receiver reads the same instance
+    return true;
+  }
+
+  @Override
+  public void send(MseBlock.Data data) {
+    QueryThreadContext.checkTerminationAndSampleUsage(SEND_SCOPE);
+    sendPrivate(data, List.of());
+  }
+
+  @Override
+  public void send(MseBlock.Eos block, List<DataBuffer> serializedStats) {
+    sendPrivate(block, serializedStats);
+    _isTerminated = true;
+  }
+
+  private void sendPrivate(MseBlock block, List<DataBuffer> serializedStats) {
+    if (isTerminated() || (isEarlyTerminated() && block.isData())) {
+      LOGGER.debug("Mailbox {} already terminated, ignoring block {}", _id, block);
+      return;
+    }
+    if (_receivingMailbox == null) {
+      _receivingMailbox = _mailboxService.getReceivingMailbox(_id);
+    }
+    _statMap.merge(MailboxSendOperator.StatKey.IN_MEMORY_MESSAGES, 1);
+    long timeoutMs = _deadlineMs - System.currentTimeMillis();
+    ReceivingMailbox.ReceivingMailboxStatus status = _receivingMailbox.offer(block, serializedStats, timeoutMs);
+    switch (status) {
+      case SUCCESS:
+        break;
+      case WAITING_EOS:
+        _isEarlyTerminated = true;
+        break;
+      case LAST_BLOCK:
+        _isTerminated = true;
+        break;
+      case ALREADY_TERMINATED:
+        // this can happen when the mailbox is cancelled by the receiver. No more messages are going to be accepted.
+        _isTerminated = true;
+        break;
+      default:
+        throw new IllegalStateException("Unsupported mailbox status: " + status);
+    }
+  }
+
+  @Override
+  public void cancel(Throwable t) {
+    if (_isTerminated) {
+      return;
+    }
+    _isTerminated = true;
+    LOGGER.debug("Cancelling mailbox: {}", _id);
+    if (_receivingMailbox == null) {
+      _receivingMailbox = _mailboxService.getReceivingMailbox(_id);
+    }
+    _receivingMailbox.setErrorBlock(
+        ErrorMseBlock.fromException(new QueryCancelledException(
+            "Cancelled by sender with exception: " + t.getMessage())), List.of());
+  }
+
+  @Override
+  public boolean isEarlyTerminated() {
+    return _isEarlyTerminated;
+  }
+
+  @Override
+  public boolean isTerminated() {
+    return _isTerminated;
+  }
+
+  @Override
+  public String toString() {
+    return "m" + _id;
+  }
+
+  @Override
+  public void close() {
+    if (!isTerminated()) {
+      String msg = "Closing in-memory mailbox without proper EOS message";
+      RuntimeException exception = new RuntimeException(msg);
+      exception.fillInStackTrace();
+
+      LOGGER.error(msg, exception);
+      if (_receivingMailbox == null) {
+        _receivingMailbox = _mailboxService.getReceivingMailbox(_id);
+      }
+      _receivingMailbox.setErrorBlock(ErrorMseBlock.fromException(exception), List.of());
+    }
+  }
+}

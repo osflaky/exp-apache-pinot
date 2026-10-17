@@ -1,0 +1,310 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pinot.core.operator.filter;
+
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.OptionalInt;
+import javax.annotation.Nullable;
+import org.apache.pinot.common.request.context.predicate.Predicate;
+import org.apache.pinot.core.operator.filter.predicate.BaseDictIdBasedRegexpLikePredicateEvaluator;
+import org.apache.pinot.core.operator.filter.predicate.PredicateEvaluator;
+import org.apache.pinot.core.query.request.context.QueryContext;
+import org.apache.pinot.segment.spi.datasource.DataSource;
+import org.apache.pinot.segment.spi.index.reader.NullValueVectorReader;
+import org.apache.pinot.spi.config.table.FieldConfig;
+import org.roaringbitmap.buffer.ImmutableRoaringBitmap;
+import org.roaringbitmap.buffer.MutableRoaringBitmap;
+
+
+public class FilterOperatorUtils {
+
+  private static Implementation _instance = new DefaultImplementation();
+
+  private FilterOperatorUtils() {
+  }
+
+  public static void setImplementation(Implementation newImplementation) {
+    _instance = newImplementation;
+  }
+
+  public interface Implementation {
+
+    /// Returns the leaf filter operator (i.e. not [AndFilterOperator] or [OrFilterOperator]).
+    BaseFilterOperator getLeafFilterOperator(QueryContext queryContext, PredicateEvaluator predicateEvaluator,
+        DataSource dataSource, int numDocs);
+
+    /// Returns the AND filter operator or equivalent filter operator.
+    BaseFilterOperator getAndFilterOperator(QueryContext queryContext, List<BaseFilterOperator> filterOperators,
+        int numDocs);
+
+    /// Returns the OR filter operator or equivalent filter operator.
+    BaseFilterOperator getOrFilterOperator(QueryContext queryContext, List<BaseFilterOperator> filterOperators,
+        int numDocs);
+
+    /// Returns the NOT filter operator or equivalent filter operator.
+    BaseFilterOperator getNotFilterOperator(QueryContext queryContext, BaseFilterOperator filterOperator, int numDocs);
+  }
+
+  /// Returns the null rows of the column in this segment, or `null` when there is none.
+  ///
+  /// A column reports nulls through its null value vector, which is absent when the segment has none for the column
+  /// and can also be present but empty. Under null handling these are the rows a predicate on the column is UNKNOWN
+  /// over, and the reason a verdict of always true or always false over the column's values does not cover every row.
+  /// A consuming segment hands out a copy of its vector on each read, so callers read it once and keep the result.
+  @Nullable
+  public static ImmutableRoaringBitmap getNullBitmap(DataSource dataSource) {
+    NullValueVectorReader nullValueVector = dataSource.getNullValueVector();
+    if (nullValueVector != null) {
+      ImmutableRoaringBitmap nullBitmap = nullValueVector.getNullBitmap();
+      if (!nullBitmap.isEmpty()) {
+        return nullBitmap;
+      }
+    }
+    return null;
+  }
+
+  /// Returns whether the column holds any null value in this segment, see [#getNullBitmap].
+  public static boolean hasNulls(DataSource dataSource) {
+    return getNullBitmap(dataSource) != null;
+  }
+
+  public static class DefaultImplementation implements Implementation {
+    @Override
+    public BaseFilterOperator getLeafFilterOperator(QueryContext queryContext, PredicateEvaluator predicateEvaluator,
+        DataSource dataSource, int numDocs) {
+      // The evaluator's verdicts are over the column's real values. With null handling enabled a null row is UNKNOWN
+      // under either verdict, so it is selected by neither the predicate nor its negation: the leaf has to carry the
+      // null rows for the negation to leave them out, instead of collapsing to a constant that knows nothing of them.
+      if (predicateEvaluator.isAlwaysFalse()) {
+        ImmutableRoaringBitmap nullBitmap = queryContext.isNullHandlingEnabled() ? getNullBitmap(dataSource) : null;
+        if (nullBitmap != null) {
+          return new BitmapBasedFilterOperator(new MutableRoaringBitmap(), false, numDocs, nullBitmap);
+        }
+        return EmptyFilterOperator.getInstance();
+      } else if (predicateEvaluator.isAlwaysTrue()) {
+        ImmutableRoaringBitmap nullBitmap = queryContext.isNullHandlingEnabled() ? getNullBitmap(dataSource) : null;
+        if (nullBitmap != null) {
+          return new BitmapBasedFilterOperator(nullBitmap, true, numDocs, nullBitmap);
+        }
+        return new MatchAllFilterOperator(numDocs);
+      }
+
+      // Currently sorted index based filtering is supported only for
+      // dictionary encoded columns. The on-disk segment metadata
+      // will indicate if the column is sorted or not regardless of
+      // whether it is raw or dictionary encoded. Here when creating
+      // the filter operator, we need to make sure that sort filter
+      // operator is used only if the column is sorted and has dictionary.
+      Predicate.Type predicateType = predicateEvaluator.getPredicateType();
+      if (predicateType == Predicate.Type.RANGE) {
+        if (dataSource.getDataSourceMetadata().isSorted() && dataSource.getDictionary() != null
+            && queryContext.isIndexUseAllowed(dataSource, FieldConfig.IndexType.SORTED)) {
+          return new SortedIndexBasedFilterOperator(queryContext, predicateEvaluator, dataSource, numDocs);
+        }
+        if (RangeIndexBasedFilterOperator.canEvaluate(predicateEvaluator, dataSource)
+            && queryContext.isIndexUseAllowed(dataSource, FieldConfig.IndexType.RANGE)) {
+          return new RangeIndexBasedFilterOperator(queryContext, predicateEvaluator, dataSource, numDocs);
+        }
+        return new ScanBasedFilterOperator(queryContext, predicateEvaluator, dataSource, numDocs);
+      } else if (predicateType == Predicate.Type.REGEXP_LIKE) {
+        if (predicateEvaluator instanceof BaseDictIdBasedRegexpLikePredicateEvaluator) {
+          if (dataSource.getDataSourceMetadata().isSorted()
+              && queryContext.isIndexUseAllowed(dataSource, FieldConfig.IndexType.SORTED)) {
+            return new SortedIndexBasedFilterOperator(queryContext, predicateEvaluator, dataSource, numDocs);
+          }
+          if (dataSource.getInvertedIndex() != null
+              && queryContext.isIndexUseAllowed(dataSource, FieldConfig.IndexType.INVERTED)) {
+            return new InvertedIndexFilterOperator(queryContext, predicateEvaluator, dataSource, numDocs);
+          }
+        }
+        return new ScanBasedFilterOperator(queryContext, predicateEvaluator, dataSource, numDocs);
+      } else {
+        if (dataSource.getDataSourceMetadata().isSorted() && dataSource.getDictionary() != null
+            && queryContext.isIndexUseAllowed(dataSource, FieldConfig.IndexType.SORTED)) {
+          return new SortedIndexBasedFilterOperator(queryContext, predicateEvaluator, dataSource, numDocs);
+        }
+        if (dataSource.getInvertedIndex() != null
+            && queryContext.isIndexUseAllowed(dataSource, FieldConfig.IndexType.INVERTED)) {
+          return new InvertedIndexFilterOperator(queryContext, predicateEvaluator, dataSource, numDocs);
+        }
+        if (RangeIndexBasedFilterOperator.canEvaluate(predicateEvaluator, dataSource)
+            && queryContext.isIndexUseAllowed(dataSource, FieldConfig.IndexType.RANGE)) {
+          return new RangeIndexBasedFilterOperator(queryContext, predicateEvaluator, dataSource, numDocs);
+        }
+        return new ScanBasedFilterOperator(queryContext, predicateEvaluator, dataSource, numDocs);
+      }
+    }
+
+    @Override
+    public BaseFilterOperator getAndFilterOperator(QueryContext queryContext, List<BaseFilterOperator> filterOperators,
+        int numDocs) {
+      List<BaseFilterOperator> childFilterOperators = new ArrayList<>(filterOperators.size());
+      for (BaseFilterOperator filterOperator : filterOperators) {
+        if (filterOperator.isResultEmpty()) {
+          return EmptyFilterOperator.getInstance();
+        } else if (!filterOperator.isResultMatchingAll()) {
+          childFilterOperators.add(filterOperator);
+        }
+      }
+      int numChildFilterOperators = childFilterOperators.size();
+      if (numChildFilterOperators == 0) {
+        // Return match all filter operator if all child filter operators match all records
+        return new MatchAllFilterOperator(numDocs);
+      } else if (numChildFilterOperators == 1) {
+        // Return the child filter operator if only one left
+        return childFilterOperators.get(0);
+      } else {
+        // Return the AND filter operator with re-ordered child filter operators
+        reorderAndFilterChildOperators(queryContext, childFilterOperators);
+        return new AndFilterOperator(childFilterOperators, queryContext.getQueryOptions(), numDocs,
+            queryContext.isNullHandlingEnabled());
+      }
+    }
+
+    @Override
+    public BaseFilterOperator getOrFilterOperator(QueryContext queryContext, List<BaseFilterOperator> filterOperators,
+        int numDocs) {
+      List<BaseFilterOperator> childFilterOperators = new ArrayList<>(filterOperators.size());
+      for (BaseFilterOperator filterOperator : filterOperators) {
+        if (filterOperator.isResultMatchingAll()) {
+          return new MatchAllFilterOperator(numDocs);
+        } else if (!filterOperator.isResultEmpty()) {
+          childFilterOperators.add(filterOperator);
+        }
+      }
+      int numChildFilterOperators = childFilterOperators.size();
+      if (numChildFilterOperators == 0) {
+        // Return empty filter operator if all child filter operators's result is empty
+        return EmptyFilterOperator.getInstance();
+      } else if (numChildFilterOperators == 1) {
+        // Return the child filter operator if only one left
+        return childFilterOperators.get(0);
+      } else {
+        // Return the OR filter operator with child filter operators
+        return new OrFilterOperator(childFilterOperators, queryContext.getQueryOptions(), numDocs,
+            queryContext.isNullHandlingEnabled());
+      }
+    }
+
+    @Override
+    public BaseFilterOperator getNotFilterOperator(QueryContext queryContext, BaseFilterOperator filterOperator,
+        int numDocs) {
+      if (filterOperator.isResultMatchingAll()) {
+        return EmptyFilterOperator.getInstance();
+      } else if (filterOperator.isResultEmpty()) {
+        return new MatchAllFilterOperator(numDocs);
+      }
+
+      return new NotFilterOperator(filterOperator, numDocs, queryContext.isNullHandlingEnabled());
+    }
+
+    /// For AND filter operator, reorders its child filter operators based on their cost and puts the ones with
+    /// inverted index first in order to reduce the number of documents to be processed.
+    ///
+    /// Special filter operators such as [MatchAllFilterOperator] and [EmptyFilterOperator] should be
+    /// removed from the list before calling this method.
+    protected void reorderAndFilterChildOperators(QueryContext queryContext, List<BaseFilterOperator> filterOperators) {
+      filterOperators.sort(new Comparator<BaseFilterOperator>() {
+        @Override
+        public int compare(BaseFilterOperator o1, BaseFilterOperator o2) {
+          return getPriority(o1) - getPriority(o2);
+        }
+
+        int getPriority(BaseFilterOperator filterOperator) {
+          if (filterOperator instanceof PrioritizedFilterOperator) {
+            OptionalInt priority = ((PrioritizedFilterOperator<?>) filterOperator).getPriority();
+            if (priority.isPresent()) {
+              return priority.getAsInt();
+            }
+          }
+          if (filterOperator instanceof SortedIndexBasedFilterOperator) {
+            return PrioritizedFilterOperator.HIGH_PRIORITY;
+          }
+          if (filterOperator instanceof BitmapBasedFilterOperator
+              || filterOperator instanceof InvertedIndexFilterOperator) {
+            return PrioritizedFilterOperator.MEDIUM_PRIORITY;
+          }
+          if (filterOperator instanceof RangeIndexBasedFilterOperator
+              || filterOperator instanceof TextMatchFilterOperator || filterOperator instanceof JsonMatchFilterOperator
+              || filterOperator instanceof H3IndexFilterOperator
+              || filterOperator instanceof H3InclusionIndexFilterOperator) {
+            return PrioritizedFilterOperator.LOW_PRIORITY;
+          }
+          if (filterOperator instanceof AndFilterOperator) {
+            return PrioritizedFilterOperator.AND_PRIORITY;
+          }
+          if (filterOperator instanceof OrFilterOperator) {
+            return PrioritizedFilterOperator.OR_PRIORITY;
+          }
+          if (filterOperator instanceof NotFilterOperator) {
+            return getPriority(((NotFilterOperator) filterOperator).getChildFilterOperator());
+          }
+          if (filterOperator instanceof ScanBasedFilterOperator) {
+            int basePriority = PrioritizedFilterOperator.SCAN_PRIORITY;
+            return getScanBasedFilterPriority(queryContext, (ScanBasedFilterOperator) filterOperator, basePriority);
+          }
+          if (filterOperator instanceof ExpressionFilterOperator) {
+            return PrioritizedFilterOperator.EXPRESSION_PRIORITY;
+          }
+          return PrioritizedFilterOperator.UNKNOWN_FILTER_PRIORITY;
+        }
+      });
+    }
+
+    public static int getScanBasedFilterPriority(QueryContext queryContext,
+        ScanBasedFilterOperator scanBasedFilterOperator, int basePriority) {
+      if (queryContext.isSkipScanFilterReorder()) {
+        return basePriority;
+      }
+
+      if (scanBasedFilterOperator.getDataSourceMetadata().isSingleValue()) {
+        return basePriority;
+      } else {
+        // Lower priority for multi-value column
+        return basePriority + 50;
+      }
+    }
+  }
+
+  /// Returns the leaf filter operator (i.e. not [AndFilterOperator] or [OrFilterOperator]).
+  public static BaseFilterOperator getLeafFilterOperator(QueryContext queryContext,
+      PredicateEvaluator predicateEvaluator, DataSource dataSource, int numDocs) {
+    return _instance.getLeafFilterOperator(queryContext, predicateEvaluator, dataSource, numDocs);
+  }
+
+  /// Returns the AND filter operator or equivalent filter operator.
+  public static BaseFilterOperator getAndFilterOperator(QueryContext queryContext,
+      List<BaseFilterOperator> filterOperators, int numDocs) {
+    return _instance.getAndFilterOperator(queryContext, filterOperators, numDocs);
+  }
+
+  /// Returns the OR filter operator or equivalent filter operator.
+  public static BaseFilterOperator getOrFilterOperator(QueryContext queryContext,
+      List<BaseFilterOperator> filterOperators, int numDocs) {
+    return _instance.getOrFilterOperator(queryContext, filterOperators, numDocs);
+  }
+
+  /// Returns the NOT filter operator or equivalent filter operator.
+  public static BaseFilterOperator getNotFilterOperator(QueryContext queryContext, BaseFilterOperator filterOperator,
+      int numDocs) {
+    return _instance.getNotFilterOperator(queryContext, filterOperator, numDocs);
+  }
+}

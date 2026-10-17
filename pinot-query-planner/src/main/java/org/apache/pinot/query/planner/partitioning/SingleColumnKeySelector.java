@@ -1,0 +1,55 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pinot.query.planner.partitioning;
+
+import javax.annotation.Nullable;
+
+
+public class SingleColumnKeySelector implements KeySelector<Object> {
+  private final int _keyId;
+  private final String _hashFunction;
+  private final HashFunctionSelector.SvHasher _hasher;
+
+  public SingleColumnKeySelector(int keyId) {
+    this(keyId, KeySelector.DEFAULT_HASH_ALGORITHM);
+  }
+
+  public SingleColumnKeySelector(int keyId, String hashFunction) {
+    _keyId = keyId;
+    _hashFunction = hashFunction.toLowerCase();
+    _hasher = HashFunctionSelector.getSvHasher(_hashFunction);
+  }
+
+  @Nullable
+  @Override
+  public Object getKey(Object[] row) {
+    return row[_keyId];
+  }
+
+  @Override
+  public int computeHash(Object[] input) {
+    Object key = input[_keyId];
+    return _hasher.hash(key);
+  }
+
+  @Override
+  public String hashAlgorithm() {
+    return _hashFunction;
+  }
+}
